@@ -5,6 +5,13 @@ import { Play, Image as ImageIcon, Book, ArrowLeft, ArrowRight, X } from 'lucide
 
 const API_URL = 'http://localhost:3001/api';
 
+// Configurable Navigation Keybinds (change these to your preference)
+const NAV_KEYS = {
+  previous: ['ArrowLeft', '1'],  // Keys for going backwards
+  next: ['ArrowRight', '2'],     // Keys for going forward
+  close: ['Escape']              // Keys for closing viewer
+};
+
 // Helper to construct media URL
 const getMediaUrl = (path, thumbnail = false) => {
   const url = new URLSearchParams();
@@ -28,6 +35,25 @@ function Toast({ message, loading, onClose }) {
         <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
       )}
       <span>{message}</span>
+    </div>
+  );
+}
+
+// Progress Bar Component
+function ProgressBar({ current, total, currentItem }) {
+  const percentage = total > 0 ? Math.round((current / total) * 100) : 0;
+  
+  return (
+    <div className="fixed bottom-6 right-6 bg-gray-800 text-white p-4 rounded-lg shadow-lg z-[200] animate-fade-in min-w-[300px]">
+      <div className="mb-2 text-sm font-semibold">Scanning Library...</div>
+      <div className="mb-2 text-xs text-gray-400 truncate">{currentItem || 'Starting...'}</div>
+      <div className="w-full bg-gray-700 rounded-full h-2.5">
+        <div 
+          className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
+          style={{ width: `${percentage}%` }}
+        ></div>
+      </div>
+      <div className="mt-2 text-xs text-gray-300">{current} / {total} artists</div>
     </div>
   );
 }
@@ -127,6 +153,7 @@ export default function App() {
   const [items, setItems] = useState([]);
   const [totalPages, setTotalPages] = useState(1);
   const [toast, setToast] = useState(null);
+  const [scanProgress, setScanProgress] = useState(null);
 
   // Viewer State (derived from URL)
   const viewerIndex = searchParams.get('i') ? parseInt(searchParams.get('i')) : null;
@@ -169,15 +196,52 @@ export default function App() {
   };
 
   const triggerScan = async () => {
-    setToast({ message: 'Resetting database and scanning...', loading: true });
     try {
+      // Show initial progress
+      setScanProgress({ current: 0, total: 0, status: 'preparing', currentItem: 'Initializing...' });
+      
+      // Connect to SSE for progress updates FIRST
+      const eventSource = new EventSource(`${API_URL}/scan/progress`);
+      
+      eventSource.onmessage = (event) => {
+        const progress = JSON.parse(event.data);
+        console.log('Progress update:', progress);
+        
+        if (progress.status === 'scanning') {
+          setScanProgress(progress);
+        } else if (progress.status === 'complete') {
+          setScanProgress(null);
+          setToast({ message: 'Scan complete! Refreshing results.', loading: false });
+          eventSource.close();
+          const page = parseInt(searchParams.get('page')) || 1;
+          fetchResults(query, searchParams.get('text') || '', page);
+        } else if (progress.status === 'error') {
+          setScanProgress(null);
+          setToast({ message: 'Scan failed', loading: false });
+          eventSource.close();
+        } else if (progress.status === 'idle') {
+          // Initial connection, just keep showing preparing state
+        }
+      };
+      
+      eventSource.onerror = (err) => {
+        console.error('SSE error:', err);
+        eventSource.close();
+        setScanProgress(null);
+        setToast({ message: 'Connection error', loading: false });
+      };
+      
+      // Wait a bit for SSE connection to establish
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Reset database and start scan
       await axios.post(`${API_URL}/reset`);
       await axios.post(`${API_URL}/scan`);
-      setToast({ message: 'Scan complete! Refreshing results.', loading: false });
-      const page = parseInt(searchParams.get('page')) || 1;
-      fetchResults(query, searchParams.get('text') || '', page);
+      
     } catch (err) {
+      console.error('Scan error:', err);
       setToast({ message: 'Scan failed: ' + err.message, loading: false });
+      setScanProgress(null);
     }
   };
 
@@ -285,9 +349,9 @@ export default function App() {
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (!isFullscreen) return;
-      if (e.key === 'ArrowRight') navigateViewer(1);
-      if (e.key === 'ArrowLeft') navigateViewer(-1);
-      if (e.key === 'Escape') closeViewer();
+      if (NAV_KEYS.next.includes(e.key)) navigateViewer(1);
+      if (NAV_KEYS.previous.includes(e.key)) navigateViewer(-1);
+      if (NAV_KEYS.close.includes(e.key)) closeViewer();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
@@ -423,6 +487,9 @@ export default function App() {
       
       {/* TOAST NOTIFICATIONS */}
       {toast && <Toast message={toast.message} loading={toast.loading} onClose={() => setToast(null)} />}
+      
+      {/* PROGRESS BAR */}
+      {scanProgress && <ProgressBar current={scanProgress.current} total={scanProgress.total} currentItem={scanProgress.currentItem} />}
     </div>
   );
 }

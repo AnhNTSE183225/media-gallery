@@ -14,6 +14,14 @@ const PORT = 3001;
 app.use(cors());
 app.use(express.json());
 
+// Disable compression for SSE endpoints
+app.use((req, res, next) => {
+    if (req.path.includes('/progress')) {
+        res.set('X-No-Compression', '1');
+    }
+    next();
+});
+
 // --- DATABASE SETUP ---
 // Enable Foreign Keys explicitly
 db.pragma('foreign_keys = ON');
@@ -41,6 +49,39 @@ const insertTag = db.prepare(`INSERT INTO asset_tags (asset_id, tag) VALUES (?, 
 // clearTags is redundant with ON DELETE CASCADE but kept for safety/clarity if needed manually
 const clearTags = db.prepare(`DELETE FROM asset_tags WHERE asset_id = ?`);
 
+// Progress tracking
+let scanProgress = { current: 0, total: 0, status: 'idle', currentItem: '' };
+let progressClients = [];
+
+function broadcastProgress() {
+    const data = `data: ${JSON.stringify(scanProgress)}\n\n`;
+    console.log(`Broadcasting to ${progressClients.length} clients:`, scanProgress);
+    progressClients.forEach(client => {
+        try {
+            client.write(data);
+        } catch (err) {
+            console.error('Error writing to client:', err.message);
+        }
+    });
+}
+
+function countArtists(dirPath) {
+    if (!fs.existsSync(dirPath)) return 0;
+    try {
+        const items = fs.readdirSync(dirPath);
+        return items.filter(item => {
+            try {
+                const stat = fs.statSync(path.join(dirPath, item));
+                return stat.isDirectory();
+            } catch (e) {
+                return false;
+            }
+        }).length;
+    } catch (err) {
+        return 0;
+    }
+}
+
 function getFilesRecursively(dir) {
     let results = [];
     try {
@@ -62,7 +103,7 @@ function getFilesRecursively(dir) {
     return results.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
 }
 
-function scanDirectory(dirPath, artistName = null, currentTags = []) {
+async function scanDirectory(dirPath, artistName = null, currentTags = []) {
     if (!fs.existsSync(dirPath)) return;
 
     const items = fs.readdirSync(dirPath);
@@ -79,14 +120,27 @@ function scanDirectory(dirPath, artistName = null, currentTags = []) {
         if (stat.isDirectory()) {
             // LOGIC: First folder is ALWAYS Artist
             if (!artistName) {
-                scanDirectory(fullPath, item, []); // Set artist, start fresh tags
+                scanProgress.current++;
+                // Update total if we discover more artists than initially counted
+                if (scanProgress.current > scanProgress.total) {
+                    scanProgress.total = scanProgress.current;
+                }
+                scanProgress.currentItem = item;
+                broadcastProgress();
+                // Yield to event loop to allow SSE messages to flush
+                await new Promise(resolve => setImmediate(resolve));
+                await scanDirectory(fullPath, item, []); // Set artist, start fresh tags
                 continue;
             }
 
-            // LOGIC: Check Strict Allowlist
-            if (config.allowedTags.includes(item)) {
-                // It's a Tag -> Go deeper
-                scanDirectory(fullPath, artistName, [...currentTags, item]);
+            // LOGIC: Check Strict Allowlist (supports multi-tagging with +)
+            // Split folder name by + to support multiple tags in one folder
+            const folderTags = item.split('+').map(t => t.trim());
+            const allTagsValid = folderTags.every(tag => config.allowedTags.includes(tag));
+            
+            if (allTagsValid && folderTags.length > 0) {
+                // All parts are valid tags -> Add all tags and go deeper
+                await scanDirectory(fullPath, artistName, [...currentTags, ...folderTags]);
             } else {
                 // It's NOT a Tag -> It is a STORY (Strict Mode)
                 // We stop checking tags and consume everything inside as pages
@@ -97,7 +151,9 @@ function scanDirectory(dirPath, artistName = null, currentTags = []) {
                     // Tags are auto-deleted by ON DELETE CASCADE if replaced
                     // Add "Story" tag automatically
                     insertTag.run(result.lastInsertRowid, 'Story');
-                    currentTags.forEach(tag => insertTag.run(result.lastInsertRowid, tag));
+                    // Deduplicate tags before inserting
+                    const uniqueTags = [...new Set(currentTags)];
+                    uniqueTags.forEach(tag => insertTag.run(result.lastInsertRowid, tag));
                     console.log(`[Story] Indexed: ${item} (${storyPages.length} pages)`);
                 }
             }
@@ -106,7 +162,9 @@ function scanDirectory(dirPath, artistName = null, currentTags = []) {
             if (artistName && config.allowedExtensions.includes(path.extname(item).toLowerCase())) {
                 const result = insertAsset.run(fullPath, 'image', artistName, item, null);
                 // Tags are auto-deleted by ON DELETE CASCADE if replaced
-                currentTags.forEach(tag => insertTag.run(result.lastInsertRowid, tag));
+                // Deduplicate tags before inserting
+                const uniqueTags = [...new Set(currentTags)];
+                uniqueTags.forEach(tag => insertTag.run(result.lastInsertRowid, tag));
                 // console.log(`[Image] Indexed: ${item}`);
             }
         }
@@ -129,15 +187,64 @@ app.post('/api/reset', (req, res) => {
 });
 
 // 2. Trigger Scan
-app.post('/api/scan', (req, res) => {
+app.post('/api/scan', async (req, res) => {
     console.log("Starting Scan...");
     try {
-        scanDirectory(config.rootDirectory);
+        // Count artists for progress tracking
+        scanProgress = {
+            current: 0,
+            total: countArtists(config.rootDirectory),
+            status: 'scanning',
+            currentItem: ''
+        };
+        broadcastProgress();
+        
+        await scanDirectory(config.rootDirectory);
+        
+        scanProgress.status = 'complete';
+        broadcastProgress();
+        
         res.json({ success: true, message: "Scan complete" });
     } catch (err) {
         console.error(err);
+        scanProgress.status = 'error';
+        broadcastProgress();
         res.status(500).json({ error: err.message });
     }
+});
+
+// 2a. Progress Stream (SSE)
+app.get('/api/scan/progress', (req, res) => {
+    console.log('SSE client connected');
+    
+    // Set SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+    
+    // Flush headers immediately
+    res.flushHeaders();
+    
+    // Send current progress immediately
+    res.write(`data: ${JSON.stringify(scanProgress)}\n\n`);
+    console.log('Sent initial progress:', scanProgress);
+    
+    // Add client to list
+    progressClients.push(res);
+    console.log(`Total clients: ${progressClients.length}`);
+    
+    // Send heartbeat every 15 seconds to keep connection alive
+    const heartbeat = setInterval(() => {
+        res.write(': heartbeat\n\n');
+    }, 15000);
+    
+    // Remove client when they disconnect
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        progressClients = progressClients.filter(client => client !== res);
+        console.log(`Client disconnected. Remaining clients: ${progressClients.length}`);
+    });
 });
 
 // 3. Search
