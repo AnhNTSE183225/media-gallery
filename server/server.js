@@ -112,7 +112,20 @@ function scanDirectory(dirPath, artistName = null, currentTags = []) {
 
 // --- API ENDPOINTS ---
 
-// 1. Trigger Scan
+// 1. Reset Database (Clear all data)
+app.post('/api/reset', (req, res) => {
+    console.log("Resetting database...");
+    try {
+        db.prepare('DELETE FROM asset_tags').run();
+        db.prepare('DELETE FROM assets').run();
+        res.json({ success: true, message: "Database cleared" });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 2. Trigger Scan
 app.post('/api/scan', (req, res) => {
     console.log("Starting Scan...");
     try {
@@ -124,7 +137,7 @@ app.post('/api/scan', (req, res) => {
     }
 });
 
-// 2. Search
+// 3. Search
 app.get('/api/search', (req, res) => {
     const { q, text } = req.query; // q = tags, text = artist/name query
 
@@ -173,32 +186,35 @@ app.get('/api/search', (req, res) => {
         params.push(tags.length);
     }
 
-    // 5. Order Results
-    baseSql += ` ORDER BY a.artist ASC, a.name ASC`;
-
     try {
-        // --- PAGINATION LOGIC ---
+        // --- SORTING & PAGINATION LOGIC ---
+        // Note: We sort in JavaScript with natural sort instead of SQL to handle numeric filenames correctly
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 24; // Default 24 items per page
         const offset = (page - 1) * limit;
 
-        // 1. Get Total Count (Wrap original query in subquery to handle GROUP BY/HAVING correctly)
-        const countSql = `SELECT COUNT(*) as total FROM (${baseSql})`;
-        const totalResult = db.prepare(countSql).get(...params);
-        const total = totalResult ? totalResult.total : 0;
+        // 1. Get ALL results (no ORDER BY, LIMIT, or OFFSET yet)
+        const rows = db.prepare(baseSql).all(...params);
 
-        // 2. Get Data with LIMIT and OFFSET
-        const dataSql = baseSql + ` LIMIT ? OFFSET ?`;
-        const dataParams = [...params, limit, offset];
-
-        const rows = db.prepare(dataSql).all(...dataParams);
-
-        // Parse pages JSON for stories AND tags CSV
-        const items = rows.map(r => ({
+        // 2. Parse pages JSON and tags CSV
+        const parsedItems = rows.map(r => ({
             ...r,
             pages: r.pages ? JSON.parse(r.pages) : null,
             tags: r.tags ? r.tags.split(',') : []
         }));
+
+        // 3. Sort with natural (numeric) sorting
+        parsedItems.sort((a, b) => {
+            // First sort by artist
+            const artistCompare = a.artist.localeCompare(b.artist, undefined, { numeric: true, sensitivity: 'base' });
+            if (artistCompare !== 0) return artistCompare;
+            // Then by name
+            return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        });
+
+        // 4. Apply pagination manually
+        const total = parsedItems.length;
+        const items = parsedItems.slice(offset, offset + limit);
 
         res.json({
             items,
@@ -215,8 +231,7 @@ app.get('/api/search', (req, res) => {
     }
 });
 
-// 3. Serve Media (Crucial for local file access)
-// 3. Serve Media (Crucial for local file access)
+// 4. Serve Media (Crucial for local file access)
 app.get('/api/media', (req, res) => {
     const filePath = req.query.path;
     if (!filePath) {

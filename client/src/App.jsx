@@ -56,7 +56,8 @@ export default function App() {
   };
 
   const triggerScan = async () => {
-    alert("Scanning started... check server console.");
+    alert("Resetting database and scanning... check server console.");
+    await axios.post(`${API_URL}/reset`);
     await axios.post(`${API_URL}/scan`);
     alert("Scan finished! Refreshing results.");
     const page = parseInt(searchParams.get('page')) || 1;
