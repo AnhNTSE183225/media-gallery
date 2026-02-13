@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, memo } from 'react';
 import axios from 'axios';
 import { useSearchParams } from 'react-router-dom';
 import { Play, Image as ImageIcon, Book, ArrowLeft, ArrowRight, X } from 'lucide-react';
@@ -6,7 +6,119 @@ import { Play, Image as ImageIcon, Book, ArrowLeft, ArrowRight, X } from 'lucide
 const API_URL = 'http://localhost:3001/api';
 
 // Helper to construct media URL
-const getMediaUrl = (path) => `${API_URL}/media?path=${encodeURIComponent(path)}`;
+const getMediaUrl = (path, thumbnail = false) => {
+  const url = new URLSearchParams();
+  url.set('path', path);
+  if (thumbnail) url.set('thumbnail', 'true');
+  return `${API_URL}/media?${url.toString()}`;
+};
+
+// Toast Component
+function Toast({ message, loading, onClose }) {
+  useEffect(() => {
+    if (!loading) {
+      const timer = setTimeout(onClose, 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [loading, onClose]);
+  
+  return (
+    <div className="fixed bottom-6 right-6 bg-blue-600 text-white px-6 py-3 rounded-lg shadow-lg z-[200] animate-fade-in flex items-center gap-3">
+      {loading && (
+        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+      )}
+      <span>{message}</span>
+    </div>
+  );
+}
+
+// Memoized Gallery Item Component with Intersection Observer
+const GalleryItem = memo(({ item, idx, onOpen }) => {
+  const thumbnailPath = item.type === 'story' ? item.pages[0] : item.path;
+  const isVideo = thumbnailPath.match(/\.(mp4|webm|mkv|mov)$/i);
+  const videoRef = useRef(null);
+  const containerRef = useRef(null);
+  const [isVisible, setIsVisible] = useState(false);
+  
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setIsVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '100px' } // Load when within 100px of viewport
+    );
+    
+    if (containerRef.current) {
+      observer.observe(containerRef.current);
+    }
+    
+    return () => observer.disconnect();
+  }, []);
+  
+  const handleMouseEnter = () => {
+    if (videoRef.current && isVisible) {
+      videoRef.current.play().catch(() => {});
+    }
+  };
+  
+  const handleMouseLeave = () => {
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.currentTime = 1.0;
+    }
+  };
+  
+  return (
+    <div
+      ref={containerRef}
+      onClick={() => onOpen(idx)}
+      className="relative group cursor-pointer border border-gray-700 rounded overflow-hidden bg-gray-800"
+    >
+      <div className="aspect-[2/3] overflow-hidden bg-black flex items-center justify-center">
+        {isVisible ? (
+          isVideo ? (
+            <video
+              ref={videoRef}
+              src={getMediaUrl(thumbnailPath) + "#t=1.0"}
+              className="w-full h-full object-cover transition-transform group-hover:scale-105"
+              muted
+              loop
+              playsInline
+              preload="metadata"
+              onMouseEnter={handleMouseEnter}
+              onMouseLeave={handleMouseLeave}
+            />
+          ) : (
+            <img
+              src={getMediaUrl(thumbnailPath, true)}
+              alt={item.name}
+              className="w-full h-full object-cover transition-transform group-hover:scale-105"
+            />
+          )
+        ) : (
+          <div className="w-full h-full bg-gray-800" />
+        )}
+      </div>
+      <div className="p-2 text-sm">
+        <p className="font-bold truncate text-blue-300">{item.artist}</p>
+        <div className="flex justify-between items-center">
+          <p className="truncate opacity-80">{item.name}</p>
+          {item.type === 'story' && <Book size={14} className="text-yellow-500" />}
+        </div>
+        <div className="flex flex-wrap gap-1 mt-2">
+          {item.tags && item.tags.map(tag => (
+            <span key={tag} className="text-[10px] bg-gray-700 px-1.5 py-0.5 rounded text-gray-300">
+              {tag}
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+});
 
 export default function App() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -14,6 +126,7 @@ export default function App() {
   const [textSearch, setTextSearch] = useState(searchParams.get('text') || '');
   const [items, setItems] = useState([]);
   const [totalPages, setTotalPages] = useState(1);
+  const [toast, setToast] = useState(null);
 
   // Viewer State (derived from URL)
   const viewerIndex = searchParams.get('i') ? parseInt(searchParams.get('i')) : null;
@@ -56,12 +169,16 @@ export default function App() {
   };
 
   const triggerScan = async () => {
-    alert("Resetting database and scanning... check server console.");
-    await axios.post(`${API_URL}/reset`);
-    await axios.post(`${API_URL}/scan`);
-    alert("Scan finished! Refreshing results.");
-    const page = parseInt(searchParams.get('page')) || 1;
-    fetchResults(query, searchParams.get('text') || '', page);
+    setToast({ message: 'Resetting database and scanning...', loading: true });
+    try {
+      await axios.post(`${API_URL}/reset`);
+      await axios.post(`${API_URL}/scan`);
+      setToast({ message: 'Scan complete! Refreshing results.', loading: false });
+      const page = parseInt(searchParams.get('page')) || 1;
+      fetchResults(query, searchParams.get('text') || '', page);
+    } catch (err) {
+      setToast({ message: 'Scan failed: ' + err.message, loading: false });
+    }
   };
 
   const handlePageChange = (newPage) => {
@@ -213,52 +330,9 @@ export default function App() {
 
       {/* GALLERY GRID */}
       <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
-        {items.map((item, idx) => {
-          const thumbnailPath = item.type === 'story' ? item.pages[0] : item.path;
-          return (
-            <div
-              key={item.id}
-              onClick={() => openViewer(idx)}
-              className="relative group cursor-pointer border border-gray-700 rounded overflow-hidden bg-gray-800"
-            >
-              <div className="aspect-[2/3] overflow-hidden bg-black flex items-center justify-center">
-                {thumbnailPath.match(/\.(mp4|webm|mkv|mov)$/i) ? (
-                  <video
-                    src={getMediaUrl(thumbnailPath) + "#t=1.0"}
-                    className="w-full h-full object-cover transition-transform group-hover:scale-105"
-                    muted
-                    loop
-                    playsInline
-                    onMouseOver={e => e.target.play()}
-                    onMouseOut={e => { e.target.pause(); e.target.currentTime = 1.0; }}
-                  />
-                ) : (
-                  <img
-                    src={getMediaUrl(thumbnailPath)}
-                    alt={item.name}
-                    className="w-full h-full object-cover transition-transform group-hover:scale-105"
-                    loading="lazy"
-                  />
-                )}
-              </div>
-              <div className="p-2 text-sm">
-                <p className="font-bold truncate text-blue-300">{item.artist}</p>
-                <div className="flex justify-between items-center">
-                  <p className="truncate opacity-80">{item.name}</p>
-                  {item.type === 'story' && <Book size={14} className="text-yellow-500" />}
-                </div>
-                {/* Tags */}
-                <div className="flex flex-wrap gap-1 mt-2">
-                  {item.tags && item.tags.map(tag => (
-                    <span key={tag} className="text-[10px] bg-gray-700 px-1.5 py-0.5 rounded text-gray-300">
-                      {tag}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            </div>
-          );
-        })}
+        {items.map((item, idx) => (
+          <GalleryItem key={item.id} item={item} idx={idx} onOpen={openViewer} />
+        ))}
       </div>
 
       {/* PAGINATION CONTROLS */}
@@ -346,6 +420,9 @@ export default function App() {
           </button>
         </div>
       )}
+      
+      {/* TOAST NOTIFICATIONS */}
+      {toast && <Toast message={toast.message} loading={toast.loading} onClose={() => setToast(null)} />}
     </div>
   );
 }

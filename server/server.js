@@ -3,6 +3,7 @@ const Database = require('better-sqlite3');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const sharp = require('sharp');
 const config = require('./config.json');
 
 const app = express();
@@ -94,6 +95,8 @@ function scanDirectory(dirPath, artistName = null, currentTags = []) {
                 if (storyPages.length > 0) {
                     const result = insertAsset.run(fullPath, 'story', artistName, item, JSON.stringify(storyPages));
                     // Tags are auto-deleted by ON DELETE CASCADE if replaced
+                    // Add "Story" tag automatically
+                    insertTag.run(result.lastInsertRowid, 'Story');
                     currentTags.forEach(tag => insertTag.run(result.lastInsertRowid, tag));
                     console.log(`[Story] Indexed: ${item} (${storyPages.length} pages)`);
                 }
@@ -190,7 +193,7 @@ app.get('/api/search', (req, res) => {
         // --- SORTING & PAGINATION LOGIC ---
         // Note: We sort in JavaScript with natural sort instead of SQL to handle numeric filenames correctly
         const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 24; // Default 24 items per page
+        const limit = parseInt(req.query.limit) || 12; // Default 12 items per page for better performance
         const offset = (page - 1) * limit;
 
         // 1. Get ALL results (no ORDER BY, LIMIT, or OFFSET yet)
@@ -232,8 +235,10 @@ app.get('/api/search', (req, res) => {
 });
 
 // 4. Serve Media (Crucial for local file access)
-app.get('/api/media', (req, res) => {
+app.get('/api/media', async (req, res) => {
     const filePath = req.query.path;
+    const thumbnail = req.query.thumbnail === 'true';
+    
     if (!filePath) {
         console.error("Media 400: No path provided");
         return res.sendStatus(400);
@@ -242,10 +247,35 @@ app.get('/api/media', (req, res) => {
         console.error(`Media 404: File not found: ${filePath}`);
         return res.sendStatus(404);
     }
-    // console.log(`Serving: ${filePath}`); // Optional debug
-    res.sendFile(filePath, { dotfiles: 'allow' }, (err) => {
-        if (err) console.error(`Media Error sending ${filePath}:`, err);
-    });
+    
+    const ext = path.extname(filePath).toLowerCase();
+    const isImage = ['.png', '.jpg', '.jpeg', '.gif'].includes(ext);
+    const isVideo = ['.mp4', '.webm', '.mkv', '.mov'].includes(ext);
+    
+    // If thumbnail requested and it's an image, resize on-the-fly
+    if (thumbnail && isImage) {
+        try {
+            const resized = await sharp(filePath)
+                .resize(400, 600, { fit: 'cover', position: 'center' })
+                .jpeg({ quality: 80 })
+                .toBuffer();
+            
+            res.set('Content-Type', 'image/jpeg');
+            res.set('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
+            res.send(resized);
+        } catch (err) {
+            // If resize fails, fall back to original
+            res.sendFile(filePath, { dotfiles: 'allow' });
+        }
+    } else {
+        // Videos and full-size images
+        res.sendFile(filePath, { dotfiles: 'allow' }, (err) => {
+            // Suppress normal client-aborted errors (happens with video seeking/scrolling)
+            if (err && err.code !== 'ECONNABORTED' && err.code !== 'ECANCELED') {
+                console.error(`Media Error sending ${filePath}:`, err);
+            }
+        });
+    }
 });
 
 app.listen(PORT, () => {
