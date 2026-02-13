@@ -24,4 +24,4 @@ dist-ssr
 *.sw?
 
 config.json
-library.db
+*.db

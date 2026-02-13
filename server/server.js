@@ -6,13 +6,17 @@ const path = require('path');
 const config = require('./config.json');
 
 const app = express();
-const db = new Database('library.db');
+// Using v4 to force a fresh database creation because previous attempts failed or were reverted
+const db = new Database('library_v4.db');
 const PORT = 3001;
 
 app.use(cors());
 app.use(express.json());
 
 // --- DATABASE SETUP ---
+// Enable Foreign Keys explicitly
+db.pragma('foreign_keys = ON');
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS assets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,13 +30,14 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS asset_tags (
     asset_id INTEGER,
     tag TEXT,
-    FOREIGN KEY(asset_id) REFERENCES assets(id)
+    FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
   );
 `);
 
 // --- SCANNER LOGIC ---
 const insertAsset = db.prepare(`INSERT OR REPLACE INTO assets (path, type, artist, name, pages) VALUES (?, ?, ?, ?, ?)`);
 const insertTag = db.prepare(`INSERT INTO asset_tags (asset_id, tag) VALUES (?, ?)`);
+// clearTags is redundant with ON DELETE CASCADE but kept for safety/clarity if needed manually
 const clearTags = db.prepare(`DELETE FROM asset_tags WHERE asset_id = ?`);
 
 function getFilesRecursively(dir) {
@@ -88,7 +93,7 @@ function scanDirectory(dirPath, artistName = null, currentTags = []) {
 
                 if (storyPages.length > 0) {
                     const result = insertAsset.run(fullPath, 'story', artistName, item, JSON.stringify(storyPages));
-                    clearTags.run(result.lastInsertRowid);
+                    // Tags are auto-deleted by ON DELETE CASCADE if replaced
                     currentTags.forEach(tag => insertTag.run(result.lastInsertRowid, tag));
                     console.log(`[Story] Indexed: ${item} (${storyPages.length} pages)`);
                 }
@@ -97,7 +102,7 @@ function scanDirectory(dirPath, artistName = null, currentTags = []) {
             // It is a File -> It is a STANDALONE IMAGE
             if (artistName && config.allowedExtensions.includes(path.extname(item).toLowerCase())) {
                 const result = insertAsset.run(fullPath, 'image', artistName, item, null);
-                clearTags.run(result.lastInsertRowid);
+                // Tags are auto-deleted by ON DELETE CASCADE if replaced
                 currentTags.forEach(tag => insertTag.run(result.lastInsertRowid, tag));
                 // console.log(`[Image] Indexed: ${item}`);
             }
@@ -121,40 +126,111 @@ app.post('/api/scan', (req, res) => {
 
 // 2. Search
 app.get('/api/search', (req, res) => {
-    const { q } = req.query; // q = "tag1,tag2"
+    const { q, text } = req.query; // q = tags, text = artist/name query
 
-    let sql = `SELECT DISTINCT a.* FROM assets a`;
-    const params = [];
+    // Clean query builder
+    let baseSql = `SELECT DISTINCT a.*, (SELECT GROUP_CONCAT(tag) FROM asset_tags WHERE asset_id = a.id) as tags FROM assets a`;
+    let params = [];
+    let whereClauses = [];
+    let havingClause = "";
 
+    // 1. Join for Tags
     if (q) {
-        const tags = q.split(',').map(t => t.trim());
-        // This SQL ensures the asset has ALL the searched tags
-        if (tags.length > 0 && tags[0] !== '') {
+        const tags = q.split(',').map(t => t.trim()).filter(t => t !== '');
+        if (tags.length > 0) {
             const placeholders = tags.map(() => '?').join(',');
-            sql += ` JOIN asset_tags at ON a.id = at.asset_id WHERE at.tag IN (${placeholders}) GROUP BY a.id HAVING COUNT(DISTINCT at.tag) = ?`;
-            params.push(...tags, tags.length);
+            baseSql += ` JOIN asset_tags at ON a.id = at.asset_id`;
+            // Add to WHERE clause logic, usually combined with AND if other WHERE clauses exist
+            // Important: This MUST be part of the WHERE clause before GROUP BY
+            whereClauses.push(`at.tag IN (${placeholders})`);
+            params.push(...tags);
+
+            // Prepare HAVING clause for later
+            havingClause = `GROUP BY a.id HAVING COUNT(DISTINCT at.tag) = ?`;
+            // DO NOT push tags.length to params yet! Wait until we append HAVING clause to SQL.
         }
     }
 
-    // Order by Artist then Name
-    sql += ` ORDER BY a.artist ASC, a.name ASC`;
+    // 2. Filter by Text (Artist OR Name)
+    if (text) {
+        whereClauses.push(`(a.artist LIKE ? OR a.name LIKE ?)`);
+        const likeQuery = `%${text}%`;
+        params.push(likeQuery, likeQuery);
+    }
 
-    const rows = db.prepare(sql).all(...params);
+    // 3. Assemble WHERE clause
+    if (whereClauses.length > 0) {
+        baseSql += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
 
-    // Parse pages JSON for stories
-    const results = rows.map(r => ({
-        ...r,
-        pages: r.pages ? JSON.parse(r.pages) : null
-    }));
+    // 4. Append HAVING clause and its parameter (if applicable)
+    // Important: The order of params must match the order of placeholders in SQL string.
+    // Order: [TAGS...], [TEXT, TEXT], [COUNT]
+    if (havingClause) {
+        baseSql += ` ${havingClause}`;
+        // NOW push the count parameter
+        const tags = q.split(',').map(t => t.trim()).filter(t => t !== '');
+        params.push(tags.length);
+    }
 
-    res.json(results);
+    // 5. Order Results
+    baseSql += ` ORDER BY a.artist ASC, a.name ASC`;
+
+    try {
+        // --- PAGINATION LOGIC ---
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 24; // Default 24 items per page
+        const offset = (page - 1) * limit;
+
+        // 1. Get Total Count (Wrap original query in subquery to handle GROUP BY/HAVING correctly)
+        const countSql = `SELECT COUNT(*) as total FROM (${baseSql})`;
+        const totalResult = db.prepare(countSql).get(...params);
+        const total = totalResult ? totalResult.total : 0;
+
+        // 2. Get Data with LIMIT and OFFSET
+        const dataSql = baseSql + ` LIMIT ? OFFSET ?`;
+        const dataParams = [...params, limit, offset];
+
+        const rows = db.prepare(dataSql).all(...dataParams);
+
+        // Parse pages JSON for stories AND tags CSV
+        const items = rows.map(r => ({
+            ...r,
+            pages: r.pages ? JSON.parse(r.pages) : null,
+            tags: r.tags ? r.tags.split(',') : []
+        }));
+
+        res.json({
+            items,
+            pagination: {
+                total,
+                page,
+                limit,
+                totalPages: Math.ceil(total / limit)
+            }
+        });
+    } catch (err) {
+        console.error("Search Error:", err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // 3. Serve Media (Crucial for local file access)
+// 3. Serve Media (Crucial for local file access)
 app.get('/api/media', (req, res) => {
     const filePath = req.query.path;
-    if (!filePath || !fs.existsSync(filePath)) return res.sendStatus(404);
-    res.sendFile(filePath);
+    if (!filePath) {
+        console.error("Media 400: No path provided");
+        return res.sendStatus(400);
+    }
+    if (!fs.existsSync(filePath)) {
+        console.error(`Media 404: File not found: ${filePath}`);
+        return res.sendStatus(404);
+    }
+    // console.log(`Serving: ${filePath}`); // Optional debug
+    res.sendFile(filePath, { dotfiles: 'allow' }, (err) => {
+        if (err) console.error(`Media Error sending ${filePath}:`, err);
+    });
 });
 
 app.listen(PORT, () => {
