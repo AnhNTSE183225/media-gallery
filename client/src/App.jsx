@@ -7,9 +7,9 @@ const API_URL = 'http://localhost:3001/api';
 
 // Configurable Navigation Keybinds (change these to your preference)
 const NAV_KEYS = {
-  previous: ['ArrowLeft', '1'],  // Keys for going backwards
-  next: ['ArrowRight', '2'],     // Keys for going forward
-  close: ['Escape']              // Keys for closing viewer
+  previous: ['Digit1'],  // Keys for going backwards
+  next: ['Digit2'],     // Keys for going forward
+  close: ['Escape']                   // Keys for closing viewer
 };
 
 // Helper to construct media URL
@@ -154,6 +154,7 @@ export default function App() {
   const [totalPages, setTotalPages] = useState(1);
   const [toast, setToast] = useState(null);
   const [scanProgress, setScanProgress] = useState(null);
+  const videoRef = useRef(null);
 
   // Viewer State (derived from URL)
   const viewerIndex = searchParams.get('i') ? parseInt(searchParams.get('i')) : null;
@@ -278,12 +279,12 @@ export default function App() {
     });
   };
 
-  const navigateViewer = (direction) => {
+  const navigateViewer = (direction, skipStory = false) => {
     if (viewerIndex === null) return;
     const currentItem = items[viewerIndex];
 
-    // If inside a story, try to change pages first
-    if (currentItem?.type === 'story') {
+    // If inside a story and not skipping entire stories, try to change pages first
+    if (currentItem?.type === 'story' && !skipStory) {
       const newPage = storyPageIndex + direction;
       if (newPage >= 0 && newPage < currentItem.pages.length) {
         setSearchParams(prev => {
@@ -300,10 +301,21 @@ export default function App() {
 
     if (newIndex >= 0 && newIndex < items.length) {
       // Normal Navigation within page
+      const nextItem = items[newIndex];
+      const isGoingBack = direction < 0;
+      
       setSearchParams(prev => {
         const newParams = new URLSearchParams(prev);
         newParams.set('i', newIndex);
-        newParams.set('p', '0'); // Reset page
+        // If skipping stories (Shift held), always go to first page
+        // If normal navigation going back to a story, start at last page
+        if (skipStory) {
+          newParams.set('p', '0'); // Always first page when skipping stories
+        } else if (nextItem?.type === 'story' && isGoingBack) {
+          newParams.set('p', nextItem.pages.length - 1); // Last page when going back normally
+        } else {
+          newParams.set('p', '0'); // First page otherwise
+        }
         return newParams;
       });
     } else if (newIndex >= items.length) {
@@ -349,8 +361,29 @@ export default function App() {
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (!isFullscreen) return;
-      if (NAV_KEYS.next.includes(e.key)) navigateViewer(1);
-      if (NAV_KEYS.previous.includes(e.key)) navigateViewer(-1);
+      
+      // For videos with arrow keys: allow seeking when video is playing
+      const videoElement = document.querySelector('video');
+      const isArrowKey = e.code === 'ArrowLeft' || e.code === 'ArrowRight';
+      
+      if (videoElement && isArrowKey) {
+        // If video is playing (not paused, not ended), allow native seeking
+        if (!videoElement.ended && !videoElement.paused) {
+          return; // Let browser handle seeking
+        }
+      }
+      
+      // For all other keys or when video is paused/ended, use navigation
+      const skipStory = e.shiftKey;
+      
+      if (NAV_KEYS.next.includes(e.code)) {
+        e.preventDefault();
+        navigateViewer(1, skipStory);
+      }
+      if (NAV_KEYS.previous.includes(e.code)) {
+        e.preventDefault();
+        navigateViewer(-1, skipStory);
+      }
       if (NAV_KEYS.close.includes(e.key)) closeViewer();
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -365,31 +398,41 @@ export default function App() {
     <div className="min-h-screen bg-gray-900 text-white p-6 font-sans">
 
       {/* HEADER */}
-      <div className="flex gap-4 mb-6">
-        <button onClick={triggerScan} className="bg-blue-600 px-4 py-2 rounded hover:bg-blue-500">
-          Rescan Library
-        </button>
-        <form onSubmit={handleSearch} className="flex-1 flex gap-2">
-          {/* Text Search (Artist/Name) */}
-          <input
-            type="text"
-            name="text"
-            value={textSearch}
-            onChange={(e) => setTextSearch(e.target.value)}
-            placeholder="Search Artist / Story Name..."
-            className="w-1/3 p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
-          />
-          {/* Tag Search */}
-          <input
-            type="text"
-            name="q"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search tags (e.g., SFW, CG)..."
-            className="flex-1 p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
-          />
-          <button type="submit" className="hidden">Search</button>
-        </form>
+      <div className="mb-6">
+        <div className="flex gap-4 mb-2">
+          <button onClick={triggerScan} className="bg-blue-600 px-4 py-2 rounded hover:bg-blue-500">
+            Rescan Library
+          </button>
+          <form onSubmit={handleSearch} className="flex-1 flex gap-2">
+            {/* Text Search (Artist/Name) */}
+            <input
+              type="text"
+              name="text"
+              value={textSearch}
+              onChange={(e) => setTextSearch(e.target.value)}
+              placeholder="Search Artist / Story Name..."
+              className="w-1/3 p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
+            />
+            {/* Tag Search */}
+            <input
+              type="text"
+              name="q"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search tags (e.g., tag1,tag2 | tag3|tag4 | -tag5)..."
+              className="flex-1 p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
+            />
+            <button type="submit" className="hidden">Search</button>
+          </form>
+        </div>
+        
+        {/* Search Help Text */}
+        <div className="text-xs text-gray-500 ml-auto pl-32">
+          <span className="font-semibold text-gray-400">Tag operators:</span> 
+          <span className="ml-2"><code className="bg-gray-800 px-1 py-0.5 rounded">tag1,tag2</code> = AND (both required)</span>
+          <span className="ml-3"><code className="bg-gray-800 px-1 py-0.5 rounded">tag1|tag2</code> = OR (at least one)</span>
+          <span className="ml-3"><code className="bg-gray-800 px-1 py-0.5 rounded">-tag3</code> = NOT (exclude)</span>
+        </div>
       </div>
 
       {/* GALLERY GRID */}
@@ -453,10 +496,17 @@ export default function App() {
               if (isVideo) {
                 return (
                   <video
+                    ref={videoRef}
                     src={getMediaUrl(pathToShow)}
                     controls
                     autoPlay
                     className="w-full h-full object-contain"
+                    onLoadedMetadata={() => {
+                      // Auto-focus video when it loads
+                      if (videoRef.current) {
+                        videoRef.current.focus();
+                      }
+                    }}
                   />
                 );
               }
@@ -472,13 +522,13 @@ export default function App() {
           {/* Navigation Overlay Hints */}
           <button
             className="absolute left-4 top-1/2 -translate-y-1/2 p-4 bg-white/10 hover:bg-white/20 rounded-full z-10"
-            onClick={(e) => { e.stopPropagation(); navigateViewer(-1); }}
+            onClick={(e) => { e.stopPropagation(); navigateViewer(-1, e.shiftKey); }}
           >
             <ArrowLeft size={32} />
           </button>
           <button
             className="absolute right-4 top-1/2 -translate-y-1/2 p-4 bg-white/10 hover:bg-white/20 rounded-full z-10"
-            onClick={(e) => { e.stopPropagation(); navigateViewer(1); }}
+            onClick={(e) => { e.stopPropagation(); navigateViewer(1, e.shiftKey); }}
           >
             <ArrowRight size={32} />
           </button>

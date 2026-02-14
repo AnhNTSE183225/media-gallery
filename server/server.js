@@ -247,6 +247,32 @@ app.get('/api/scan/progress', (req, res) => {
     });
 });
 
+// Parse tag query with AND, OR, NOT operators
+function parseTagQuery(queryString) {
+    if (!queryString) return { and: [], or: [], not: [] };
+    
+    const result = { and: [], or: [], not: [] };
+    
+    // Split by comma for AND groups, then check each part
+    const parts = queryString.split(',').map(t => t.trim()).filter(t => t !== '');
+    
+    for (const part of parts) {
+        if (part.startsWith('-')) {
+            // NOT operator
+            result.not.push(part.substring(1).trim());
+        } else if (part.includes('|')) {
+            // OR operator - split by pipe
+            const orTags = part.split('|').map(t => t.trim()).filter(t => t !== '');
+            result.or.push(...orTags);
+        } else {
+            // Default AND operator
+            result.and.push(part);
+        }
+    }
+    
+    return result;
+}
+
 // 3. Search
 app.get('/api/search', (req, res) => {
     const { q, text } = req.query; // q = tags, text = artist/name query
@@ -257,20 +283,57 @@ app.get('/api/search', (req, res) => {
     let whereClauses = [];
     let havingClause = "";
 
-    // 1. Join for Tags
+    // 1. Parse and handle Tags with AND/OR/NOT logic
     if (q) {
-        const tags = q.split(',').map(t => t.trim()).filter(t => t !== '');
-        if (tags.length > 0) {
-            const placeholders = tags.map(() => '?').join(',');
+        const parsedQuery = parseTagQuery(q);
+        const needsJoin = parsedQuery.and.length > 0 || parsedQuery.or.length > 0;
+        
+        if (needsJoin) {
             baseSql += ` JOIN asset_tags at ON a.id = at.asset_id`;
-            // Add to WHERE clause logic, usually combined with AND if other WHERE clauses exist
-            // Important: This MUST be part of the WHERE clause before GROUP BY
+        }
+        
+        // Handle AND tags (must have ALL)
+        if (parsedQuery.and.length > 0) {
+            const placeholders = parsedQuery.and.map(() => '?').join(',');
             whereClauses.push(`at.tag IN (${placeholders})`);
-            params.push(...tags);
-
-            // Prepare HAVING clause for later
-            havingClause = `GROUP BY a.id HAVING COUNT(DISTINCT at.tag) = ?`;
-            // DO NOT push tags.length to params yet! Wait until we append HAVING clause to SQL.
+            params.push(...parsedQuery.and);
+            
+            // HAVING clause to ensure ALL AND tags are present
+            havingClause = `GROUP BY a.id HAVING COUNT(DISTINCT at.tag) >= ?`;
+        }
+        
+        // Handle OR tags (must have AT LEAST ONE)
+        if (parsedQuery.or.length > 0) {
+            if (parsedQuery.and.length === 0) {
+                // If no AND tags, we need a simpler query
+                const placeholders = parsedQuery.or.map(() => '?').join(',');
+                whereClauses.push(`at.tag IN (${placeholders})`);
+                params.push(...parsedQuery.or);
+                
+                if (!havingClause) {
+                    havingClause = `GROUP BY a.id`;
+                }
+            } else {
+                // If we have both AND and OR, use subquery approach
+                const orPlaceholders = parsedQuery.or.map(() => '?').join(',');
+                whereClauses.push(`(at.tag IN (${[...parsedQuery.and.map(() => '?'), ...parsedQuery.or.map(() => '?')].join(',')}))`);
+                // We already pushed AND tags, now push OR tags
+                params.push(...parsedQuery.or);
+                
+                // Modify HAVING to require AND tags + at least one OR tag
+                havingClause = `GROUP BY a.id HAVING 
+                    SUM(CASE WHEN at.tag IN (${parsedQuery.and.map(() => '?').join(',')}) THEN 1 ELSE 0 END) = ? 
+                    ${parsedQuery.or.length > 0 ? `AND SUM(CASE WHEN at.tag IN (${parsedQuery.or.map(() => '?').join(',')}) THEN 1 ELSE 0 END) >= 1` : ''}`;
+            }
+        }
+        
+        // Handle NOT tags (must NOT have ANY)
+        if (parsedQuery.not.length > 0) {
+            const notPlaceholders = parsedQuery.not.map(() => '?').join(',');
+            whereClauses.push(`a.id NOT IN (
+                SELECT asset_id FROM asset_tags WHERE tag IN (${notPlaceholders})
+            )`);
+            params.push(...parsedQuery.not);
         }
     }
 
@@ -286,14 +349,26 @@ app.get('/api/search', (req, res) => {
         baseSql += ` WHERE ${whereClauses.join(' AND ')}`;
     }
 
-    // 4. Append HAVING clause and its parameter (if applicable)
-    // Important: The order of params must match the order of placeholders in SQL string.
-    // Order: [TAGS...], [TEXT, TEXT], [COUNT]
+    // 4. Append HAVING clause and its parameters
     if (havingClause) {
         baseSql += ` ${havingClause}`;
-        // NOW push the count parameter
-        const tags = q.split(',').map(t => t.trim()).filter(t => t !== '');
-        params.push(tags.length);
+        
+        // Add parameters for HAVING clause
+        if (q) {
+            const parsedQuery = parseTagQuery(q);
+            if (parsedQuery.and.length > 0 && parsedQuery.or.length > 0) {
+                // Complex case with both AND and OR
+                params.push(...parsedQuery.and); // For first CASE check
+                params.push(parsedQuery.and.length); // For count
+                if (parsedQuery.or.length > 0) {
+                    params.push(...parsedQuery.or); // For second CASE check
+                }
+            } else if (parsedQuery.and.length > 0) {
+                // Only AND tags
+                params.push(parsedQuery.and.length);
+            }
+            // OR only doesn't need extra params
+        }
     }
 
     try {
