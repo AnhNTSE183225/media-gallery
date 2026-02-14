@@ -55,7 +55,7 @@ let progressClients = [];
 
 function broadcastProgress() {
     const data = `data: ${JSON.stringify(scanProgress)}\n\n`;
-    console.log(`Broadcasting to ${progressClients.length} clients:`, scanProgress);
+    // console.log(`Broadcasting to ${progressClients.length} clients:`, scanProgress);
     progressClients.forEach(client => {
         try {
             client.write(data);
@@ -121,10 +121,6 @@ async function scanDirectory(dirPath, artistName = null, currentTags = []) {
             // LOGIC: First folder is ALWAYS Artist
             if (!artistName) {
                 scanProgress.current++;
-                // Update total if we discover more artists than initially counted
-                if (scanProgress.current > scanProgress.total) {
-                    scanProgress.total = scanProgress.current;
-                }
                 scanProgress.currentItem = item;
                 broadcastProgress();
                 // Yield to event loop to allow SSE messages to flush
@@ -154,7 +150,6 @@ async function scanDirectory(dirPath, artistName = null, currentTags = []) {
                     // Deduplicate tags before inserting
                     const uniqueTags = [...new Set(currentTags)];
                     uniqueTags.forEach(tag => insertTag.run(result.lastInsertRowid, tag));
-                    console.log(`[Story] Indexed: ${item} (${storyPages.length} pages)`);
                 }
             }
         } else {
