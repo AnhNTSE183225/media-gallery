@@ -1,0 +1,22 @@
+{
+    "rootDirectory": "C:/Users/THEANH/Pictures/.fake/Artists",
+    "allowedTags": [
+        "SFW",
+        "NSFW",
+        "CG",
+        "Image",
+        "Video",
+        "Furry",
+        "Human",
+        "AI-Generated"
+    ],
+    "allowedExtensions": [
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".mp4",
+        ".webm",
+        ".webp",
+        ".gif"
+    ]
+}
