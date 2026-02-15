@@ -1,22 +1,36 @@
 {
-    "rootDirectory": "C:/Users/THEANH/Pictures/.fake/Artists",
-    "allowedTags": [
-        "SFW",
-        "NSFW",
-        "CG",
-        "Image",
-        "Video",
-        "Furry",
-        "Human",
-        "AI-Generated"
-    ],
-    "allowedExtensions": [
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".mp4",
-        ".webm",
-        ".webp",
-        ".gif"
-    ]
+    "activeProfile": "Artists",
+    "profiles": {
+        "Artists": {
+            "rootDirectory": "C:/Users/THEANH/Pictures/.fake/Artists",
+            "allowedTags": [
+                "CG",
+                "Image",
+                "Video",
+                "Furry",
+                "Human",
+                "AI-Generated"
+            ],
+            "allowedExtensions": [
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".mp4",
+                ".webm",
+                ".webp",
+                ".gif"
+            ]
+        },
+        "Example Profile 2": {
+            "rootDirectory": "C:/Users/THEANH/Pictures/.fake/Other",
+            "allowedTags": [
+                "Wallpapers"
+            ],
+            "allowedExtensions": [
+                ".png",
+                ".jpg",
+                ".jpeg"
+            ]
+        }
+    }
 }

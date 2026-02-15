@@ -155,12 +155,47 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [scanProgress, setScanProgress] = useState(null);
   const videoRef = useRef(null);
+  
+  // Profile Management State
+  const [profiles, setProfiles] = useState([]);
+  const [activeProfile, setActiveProfile] = useState('');
 
   // Viewer State (derived from URL)
   const viewerIndex = searchParams.get('i') ? parseInt(searchParams.get('i')) : null;
   const storyPageIndex = searchParams.get('p') ? parseInt(searchParams.get('p')) : 0;
 
   const isFullscreen = viewerIndex !== null;
+  
+  // Fetch profiles on mount
+  useEffect(() => {
+    fetchProfiles();
+  }, []);
+
+  const fetchProfiles = async () => {
+    try {
+      const res = await axios.get(`${API_URL}/profiles`);
+      setProfiles(res.data.profiles || []);
+      setActiveProfile(res.data.activeProfile || '');
+    } catch (err) {
+      console.error('Error fetching profiles:', err);
+    }
+  };
+  
+  const switchProfile = async (profileName) => {
+    try {
+      setToast({ message: `Switching to ${profileName}...`, loading: true });
+      const res = await axios.post(`${API_URL}/profiles/switch`, { profileName });
+      setActiveProfile(profileName);
+      setToast({ message: `Switched to ${profileName}`, loading: false });
+      
+      // Refresh results for new profile
+      const page = parseInt(searchParams.get('page')) || 1;
+      await fetchResults(query, searchParams.get('text') || '', page);
+    } catch (err) {
+      console.error('Error switching profile:', err);
+      setToast({ message: 'Failed to switch profile', loading: false });
+    }
+  };
 
   // Sync Query with URL
   useEffect(() => {
@@ -400,6 +435,18 @@ export default function App() {
       {/* HEADER */}
       <div className="mb-6">
         <div className="flex gap-4 mb-2">
+          {/* Profile Selector */}
+          {profiles.length > 0 && (
+            <select 
+              value={activeProfile} 
+              onChange={(e) => switchProfile(e.target.value)}
+              className="bg-gray-800 px-4 py-2 rounded border border-gray-700 hover:border-blue-500 focus:outline-none focus:border-blue-500 cursor-pointer"
+            >
+              {profiles.map(profile => (
+                <option key={profile} value={profile}>{profile}</option>
+              ))}
+            </select>
+          )}
           <button onClick={triggerScan} className="bg-blue-600 px-4 py-2 rounded hover:bg-blue-500">
             Rescan Library
           </button>

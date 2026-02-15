@@ -4,12 +4,70 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
-const config = require('./config.json');
 
 const app = express();
-// Using v4 to force a fresh database creation because previous attempts failed or were reverted
-const db = new Database('library_v4.db');
 const PORT = 3001;
+
+// --- PROFILE MANAGEMENT ---
+let config = require('./config.json');
+let activeProfileName = config.activeProfile || Object.keys(config.profiles)[0];
+let db = null;
+
+// Get current active profile configuration
+function getActiveProfile() {
+    return config.profiles[activeProfileName];
+}
+
+// Get database filename for a profile
+function getDbFileName(profileName) {
+    // Sanitize profile name for filename
+    const safeName = profileName.replace(/[^a-zA-Z0-9]/g, '_');
+    return `library_${safeName}.db`;
+}
+
+// Prepared statements (will be initialized with database)
+let insertAsset;
+let insertTag;
+let clearTags;
+
+// Initialize database for current profile
+function initDatabase() {
+    if (db) {
+        db.close();
+    }
+    
+    const dbFile = getDbFileName(activeProfileName);
+    console.log(`Loading database for profile "${activeProfileName}": ${dbFile}`);
+    db = new Database(dbFile);
+    
+    // Enable Foreign Keys explicitly
+    db.pragma('foreign_keys = ON');
+    
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS assets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT UNIQUE,
+        type TEXT,       -- 'image' or 'story'
+        artist TEXT,
+        name TEXT,       -- filename for images, folder name for stories
+        pages TEXT,      -- JSON array of file paths if it is a story
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS asset_tags (
+        asset_id INTEGER,
+        tag TEXT,
+        FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
+      );
+    `);
+    
+    // Create/recreate prepared statements for the new database connection
+    insertAsset = db.prepare(`INSERT OR REPLACE INTO assets (path, type, artist, name, pages) VALUES (?, ?, ?, ?, ?)`);
+    insertTag = db.prepare(`INSERT INTO asset_tags (asset_id, tag) VALUES (?, ?)`);
+    clearTags = db.prepare(`DELETE FROM asset_tags WHERE asset_id = ?`);
+}
+
+// Initialize on startup
+initDatabase();
 
 app.use(cors());
 app.use(express.json());
@@ -22,33 +80,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// --- DATABASE SETUP ---
-// Enable Foreign Keys explicitly
-db.pragma('foreign_keys = ON');
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS assets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    path TEXT UNIQUE,
-    type TEXT,       -- 'image' or 'story'
-    artist TEXT,
-    name TEXT,       -- filename for images, folder name for stories
-    pages TEXT,      -- JSON array of file paths if it is a story
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS asset_tags (
-    asset_id INTEGER,
-    tag TEXT,
-    FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
-  );
-`);
-
 // --- SCANNER LOGIC ---
-const insertAsset = db.prepare(`INSERT OR REPLACE INTO assets (path, type, artist, name, pages) VALUES (?, ?, ?, ?, ?)`);
-const insertTag = db.prepare(`INSERT INTO asset_tags (asset_id, tag) VALUES (?, ?)`);
-// clearTags is redundant with ON DELETE CASCADE but kept for safety/clarity if needed manually
-const clearTags = db.prepare(`DELETE FROM asset_tags WHERE asset_id = ?`);
-
 // Progress tracking
 let scanProgress = { current: 0, total: 0, status: 'idle', currentItem: '' };
 let progressClients = [];
@@ -92,7 +124,7 @@ function getFilesRecursively(dir) {
             if (stat && stat.isDirectory()) {
                 results = results.concat(getFilesRecursively(filePath));
             } else {
-                if (config.allowedExtensions.includes(path.extname(file).toLowerCase())) {
+                if (getActiveProfile().allowedExtensions.includes(path.extname(file).toLowerCase())) {
                     results.push(filePath);
                 }
             }
@@ -132,7 +164,7 @@ async function scanDirectory(dirPath, artistName = null, currentTags = []) {
             // LOGIC: Check Strict Allowlist (supports multi-tagging with +)
             // Split folder name by + to support multiple tags in one folder
             const folderTags = item.split('+').map(t => t.trim());
-            const allTagsValid = folderTags.every(tag => config.allowedTags.includes(tag));
+            const allTagsValid = folderTags.every(tag => getActiveProfile().allowedTags.includes(tag));
             
             if (allTagsValid && folderTags.length > 0) {
                 // All parts are valid tags -> Add all tags and go deeper
@@ -154,7 +186,7 @@ async function scanDirectory(dirPath, artistName = null, currentTags = []) {
             }
         } else {
             // It is a File -> It is a STANDALONE IMAGE
-            if (artistName && config.allowedExtensions.includes(path.extname(item).toLowerCase())) {
+            if (artistName && getActiveProfile().allowedExtensions.includes(path.extname(item).toLowerCase())) {
                 const result = insertAsset.run(fullPath, 'image', artistName, item, null);
                 // Tags are auto-deleted by ON DELETE CASCADE if replaced
                 // Deduplicate tags before inserting
@@ -167,6 +199,49 @@ async function scanDirectory(dirPath, artistName = null, currentTags = []) {
 }
 
 // --- API ENDPOINTS ---
+
+// 0. Profile Management
+app.get('/api/profiles', (req, res) => {
+    try {
+        res.json({
+            activeProfile: activeProfileName,
+            profiles: Object.keys(config.profiles),
+            profilesConfig: config.profiles
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/profiles/switch', (req, res) => {
+    const { profileName } = req.body;
+    
+    if (!profileName || !config.profiles[profileName]) {
+        return res.status(400).json({ error: 'Invalid profile name' });
+    }
+    
+    try {
+        activeProfileName = profileName;
+        
+        // Update config.json to persist the active profile
+        config.activeProfile = profileName;
+        fs.writeFileSync('./config.json', JSON.stringify(config, null, 4));
+        
+        // Reinitialize database for new profile
+        initDatabase();
+        
+        console.log(`Switched to profile: ${profileName}`);
+        res.json({ 
+            success: true, 
+            message: `Switched to profile: ${profileName}`,
+            activeProfile: profileName
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
 
 // 1. Reset Database (Clear all data)
 app.post('/api/reset', (req, res) => {
@@ -188,13 +263,13 @@ app.post('/api/scan', async (req, res) => {
         // Count artists for progress tracking
         scanProgress = {
             current: 0,
-            total: countArtists(config.rootDirectory),
+            total: countArtists(getActiveProfile().rootDirectory),
             status: 'scanning',
             currentItem: ''
         };
         broadcastProgress();
         
-        await scanDirectory(config.rootDirectory);
+        await scanDirectory(getActiveProfile().rootDirectory);
         
         scanProgress.status = 'complete';
         broadcastProgress();
