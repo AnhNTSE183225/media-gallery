@@ -12,6 +12,9 @@ const NAV_KEYS = {
   close: ['Escape']                   // Keys for closing viewer
 };
 
+// Video skip duration in seconds (change this to your preference)
+const VIDEO_SKIP_SECONDS = 3;
+
 // Helper to construct media URL
 const getMediaUrl = (path, thumbnail = false) => {
   const url = new URLSearchParams();
@@ -397,18 +400,36 @@ export default function App() {
     const handleKeyDown = (e) => {
       if (!isFullscreen) return;
       
-      // For videos with arrow keys: allow seeking when video is playing
-      const videoElement = document.querySelector('video');
+      // For videos with arrow keys: custom seeking
+      const videoElement = videoRef.current;
       const isArrowKey = e.code === 'ArrowLeft' || e.code === 'ArrowRight';
       
       if (videoElement && isArrowKey) {
-        // If video is playing (not paused, not ended), allow native seeking
-        if (!videoElement.ended && !videoElement.paused) {
-          return; // Let browser handle seeking
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        
+        const wasPlaying = !videoElement.paused;
+        const skipAmount = e.code === 'ArrowRight' ? VIDEO_SKIP_SECONDS : -VIDEO_SKIP_SECONDS;
+        const newTime = videoElement.currentTime + skipAmount;
+        
+        if (wasPlaying) {
+          videoElement.pause();
         }
+        
+        if (videoElement.duration) {
+          videoElement.currentTime = Math.max(0, Math.min(videoElement.duration, newTime));
+        } else {
+          videoElement.currentTime = Math.max(0, newTime);
+        }
+        
+        if (wasPlaying) {
+          videoElement.play().catch(() => {});
+        }
+        return;
       }
       
-      // For all other keys or when video is paused/ended, use navigation
+      // For all other keys, use navigation
       const skipStory = e.shiftKey;
       
       if (NAV_KEYS.next.includes(e.code)) {
@@ -421,8 +442,9 @@ export default function App() {
       }
       if (NAV_KEYS.close.includes(e.key)) closeViewer();
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    // Use capture: true to intercept events before browser defaults
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
   }, [isFullscreen, viewerIndex, storyPageIndex, items]);
 
   // --- RENDERERS ---
