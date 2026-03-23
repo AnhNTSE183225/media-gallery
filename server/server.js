@@ -28,7 +28,6 @@ function getDbFileName(profileName) {
 // Prepared statements (will be initialized with database)
 let insertAsset;
 let insertTag;
-let clearTags;
 
 // Initialize database for current profile
 function initDatabase() {
@@ -63,7 +62,6 @@ function initDatabase() {
     // Create/recreate prepared statements for the new database connection
     insertAsset = db.prepare(`INSERT OR REPLACE INTO assets (path, type, artist, name, pages) VALUES (?, ?, ?, ?, ?)`);
     insertTag = db.prepare(`INSERT INTO asset_tags (asset_id, tag) VALUES (?, ?)`);
-    clearTags = db.prepare(`DELETE FROM asset_tags WHERE asset_id = ?`);
 }
 
 // Initialize on startup
@@ -72,45 +70,45 @@ initDatabase();
 app.use(cors());
 app.use(express.json());
 
-// Disable compression for SSE endpoints
-app.use((req, res, next) => {
-    if (req.path.includes('/progress')) {
-        res.set('X-No-Compression', '1');
-    }
-    next();
-});
-
 // --- SCANNER LOGIC ---
-// Progress tracking
-let scanProgress = { current: 0, total: 0, status: 'idle', currentItem: '' };
-let progressClients = [];
-
-function broadcastProgress() {
-    const data = `data: ${JSON.stringify(scanProgress)}\n\n`;
-    // console.log(`Broadcasting to ${progressClients.length} clients:`, scanProgress);
-    progressClients.forEach(client => {
-        try {
-            client.write(data);
-        } catch (err) {
-            console.error('Error writing to client:', err.message);
-        }
-    });
-}
+let isScanning = false;
+let bootstrapStatus = {
+    status: 'pending',
+    profile: activeProfileName,
+    startedAt: null,
+    finishedAt: null,
+    error: null,
+    message: 'Startup sync has not started yet.'
+};
 
 function countArtists(dirPath) {
     if (!fs.existsSync(dirPath)) return 0;
+
     try {
         const items = fs.readdirSync(dirPath);
         return items.filter(item => {
             try {
-                const stat = fs.statSync(path.join(dirPath, item));
-                return stat.isDirectory();
+                return fs.statSync(path.join(dirPath, item)).isDirectory();
             } catch (e) {
                 return false;
             }
         }).length;
     } catch (err) {
         return 0;
+    }
+}
+
+function logScanProgress(scanContext, artistName) {
+    if (!scanContext || scanContext.totalArtists <= 0) return;
+
+    scanContext.processedArtists += 1;
+    const percentage = Math.floor((scanContext.processedArtists / scanContext.totalArtists) * 100);
+
+    if (percentage > scanContext.lastLoggedPercent || scanContext.processedArtists === scanContext.totalArtists) {
+        scanContext.lastLoggedPercent = percentage;
+        console.log(
+            `[Scan][${activeProfileName}] ${percentage}% (${scanContext.processedArtists}/${scanContext.totalArtists}) - ${artistName}`
+        );
     }
 }
 
@@ -135,12 +133,15 @@ function getFilesRecursively(dir) {
     return results.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
 }
 
-async function scanDirectory(dirPath, artistName = null, currentTags = []) {
+async function scanDirectory(dirPath, artistName = null, currentTags = [], scanContext = null) {
     if (!fs.existsSync(dirPath)) return;
 
     const items = fs.readdirSync(dirPath);
 
     for (const item of items) {
+        // Keep scans responsive so API requests (e.g. status polling) are not starved.
+        await new Promise(resolve => setImmediate(resolve));
+
         const fullPath = path.join(dirPath, item);
         let stat;
         try {
@@ -152,12 +153,8 @@ async function scanDirectory(dirPath, artistName = null, currentTags = []) {
         if (stat.isDirectory()) {
             // LOGIC: First folder is ALWAYS Artist
             if (!artistName) {
-                scanProgress.current++;
-                scanProgress.currentItem = item;
-                broadcastProgress();
-                // Yield to event loop to allow SSE messages to flush
-                await new Promise(resolve => setImmediate(resolve));
-                await scanDirectory(fullPath, item, []); // Set artist, start fresh tags
+                logScanProgress(scanContext, item);
+                await scanDirectory(fullPath, item, [], scanContext); // Set artist, start fresh tags
                 continue;
             }
 
@@ -168,7 +165,7 @@ async function scanDirectory(dirPath, artistName = null, currentTags = []) {
             
             if (allTagsValid && folderTags.length > 0) {
                 // All parts are valid tags -> Add all tags and go deeper
-                await scanDirectory(fullPath, artistName, [...currentTags, ...folderTags]);
+                await scanDirectory(fullPath, artistName, [...currentTags, ...folderTags], scanContext);
             } else {
                 // It's NOT a Tag -> It is a STORY (Strict Mode)
                 // We stop checking tags and consume everything inside as pages
@@ -198,6 +195,88 @@ async function scanDirectory(dirPath, artistName = null, currentTags = []) {
     }
 }
 
+function clearDatabase() {
+    db.prepare('DELETE FROM asset_tags').run();
+    db.prepare('DELETE FROM assets').run();
+}
+
+async function runScanJob({ updateBootstrapStatus = false } = {}) {
+    if (isScanning) {
+        const error = new Error('A scan is already running');
+        error.statusCode = 409;
+        throw error;
+    }
+
+    isScanning = true;
+    if (updateBootstrapStatus) {
+        bootstrapStatus = {
+            status: 'running',
+            profile: activeProfileName,
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+            error: null,
+            message: `Syncing profile "${activeProfileName}"...`
+        };
+    }
+
+    try {
+        clearDatabase();
+        const rootDirectory = getActiveProfile().rootDirectory;
+        const totalArtists = countArtists(rootDirectory);
+        const scanContext = {
+            totalArtists,
+            processedArtists: 0,
+            lastLoggedPercent: -1
+        };
+
+        if (totalArtists === 0) {
+            console.log(`[Scan][${activeProfileName}] 100% (0/0) - No artist folders found`);
+        } else {
+            console.log(`[Scan][${activeProfileName}] 0% (0/${totalArtists}) - Starting scan`);
+        }
+
+        await scanDirectory(rootDirectory, null, [], scanContext);
+        console.log(`[Scan][${activeProfileName}] 100% (${scanContext.processedArtists}/${totalArtists}) - Scan complete`);
+
+        if (updateBootstrapStatus) {
+            bootstrapStatus = {
+                status: 'ready',
+                profile: activeProfileName,
+                startedAt: bootstrapStatus.startedAt,
+                finishedAt: new Date().toISOString(),
+                error: null,
+                message: `Profile "${activeProfileName}" is ready.`
+            };
+        }
+    } catch (err) {
+        if (updateBootstrapStatus) {
+            bootstrapStatus = {
+                status: 'error',
+                profile: activeProfileName,
+                startedAt: bootstrapStatus.startedAt,
+                finishedAt: new Date().toISOString(),
+                error: err.message,
+                message: `Startup sync failed for profile "${activeProfileName}".`
+            };
+        }
+        throw err;
+    } finally {
+        isScanning = false;
+    }
+}
+
+async function startBootstrapSync() {
+    if (bootstrapStatus.status === 'running' || bootstrapStatus.status === 'ready') {
+        return;
+    }
+
+    try {
+        await runScanJob({ updateBootstrapStatus: true });
+    } catch (err) {
+        console.error('Startup sync failed:', err.message);
+    }
+}
+
 // --- API ENDPOINTS ---
 
 // 0. Profile Management
@@ -214,7 +293,7 @@ app.get('/api/profiles', (req, res) => {
     }
 });
 
-app.post('/api/profiles/switch', (req, res) => {
+app.post('/api/profiles/switch', async (req, res) => {
     const { profileName } = req.body;
     
     if (!profileName || !config.profiles[profileName]) {
@@ -222,19 +301,26 @@ app.post('/api/profiles/switch', (req, res) => {
     }
     
     try {
+        if (isScanning) {
+            return res.status(409).json({ error: 'Cannot switch profiles while scanning is in progress' });
+        }
+
         activeProfileName = profileName;
         
         // Update config.json to persist the active profile
         config.activeProfile = profileName;
         fs.writeFileSync('./config.json', JSON.stringify(config, null, 4));
-        
+
         // Reinitialize database for new profile
         initDatabase();
+
+        // Always rebuild index for switched profile so data is fresh.
+        await runScanJob();
         
         console.log(`Switched to profile: ${profileName}`);
         res.json({ 
             success: true, 
-            message: `Switched to profile: ${profileName}`,
+            message: `Switched to profile: ${profileName} and scan completed`,
             activeProfile: profileName
         });
     } catch (err) {
@@ -243,78 +329,26 @@ app.post('/api/profiles/switch', (req, res) => {
     }
 });
 
-// 1. Reset Database (Clear all data)
-app.post('/api/reset', (req, res) => {
-    console.log("Resetting database...");
-    try {
-        db.prepare('DELETE FROM asset_tags').run();
-        db.prepare('DELETE FROM assets').run();
-        res.json({ success: true, message: "Database cleared" });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
-    }
+// 1. Bootstrap Status
+app.get('/api/bootstrap-status', (req, res) => {
+    res.json({
+        ...bootstrapStatus,
+        isScanning
+    });
 });
 
 // 2. Trigger Scan
 app.post('/api/scan', async (req, res) => {
     console.log("Starting Scan...");
     try {
-        // Count artists for progress tracking
-        scanProgress = {
-            current: 0,
-            total: countArtists(getActiveProfile().rootDirectory),
-            status: 'scanning',
-            currentItem: ''
-        };
-        broadcastProgress();
-        
-        await scanDirectory(getActiveProfile().rootDirectory);
-        
-        scanProgress.status = 'complete';
-        broadcastProgress();
+        await runScanJob();
         
         res.json({ success: true, message: "Scan complete" });
     } catch (err) {
         console.error(err);
-        scanProgress.status = 'error';
-        broadcastProgress();
-        res.status(500).json({ error: err.message });
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
     }
-});
-
-// 2a. Progress Stream (SSE)
-app.get('/api/scan/progress', (req, res) => {
-    console.log('SSE client connected');
-    
-    // Set SSE headers
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
-    
-    // Flush headers immediately
-    res.flushHeaders();
-    
-    // Send current progress immediately
-    res.write(`data: ${JSON.stringify(scanProgress)}\n\n`);
-    console.log('Sent initial progress:', scanProgress);
-    
-    // Add client to list
-    progressClients.push(res);
-    console.log(`Total clients: ${progressClients.length}`);
-    
-    // Send heartbeat every 15 seconds to keep connection alive
-    const heartbeat = setInterval(() => {
-        res.write(': heartbeat\n\n');
-    }, 15000);
-    
-    // Remove client when they disconnect
-    req.on('close', () => {
-        clearInterval(heartbeat);
-        progressClients = progressClients.filter(client => client !== res);
-        console.log(`Client disconnected. Remaining clients: ${progressClients.length}`);
-    });
 });
 
 // Parse tag query with AND, OR, NOT operators
@@ -532,4 +566,5 @@ app.get('/api/media', async (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    void startBootstrapSync();
 });

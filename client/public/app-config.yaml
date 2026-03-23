@@ -1,0 +1,8 @@
+videoSkipSeconds: 3
+keybinds:
+  previous:
+    - Digit1
+  next:
+    - Digit2
+  close:
+    - Escape

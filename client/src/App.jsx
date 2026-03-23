@@ -1,19 +1,43 @@
-import React, { useState, useEffect, useRef, memo } from 'react';
+import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
 import axios from 'axios';
 import { useSearchParams } from 'react-router-dom';
-import { Play, Image as ImageIcon, Book, ArrowLeft, ArrowRight, X } from 'lucide-react';
+import { Book, ArrowLeft, ArrowRight, X } from 'lucide-react';
+import { load as parseYaml } from 'js-yaml';
 
 const API_URL = 'http://localhost:3001/api';
 
-// Configurable Navigation Keybinds (change these to your preference)
-const NAV_KEYS = {
-  previous: ['Digit1'],  // Keys for going backwards
-  next: ['Digit2'],     // Keys for going forward
-  close: ['Escape']                   // Keys for closing viewer
+const DEFAULT_APP_CONFIG = {
+  videoSkipSeconds: 3,
+  keybinds: {
+    previous: ['Digit1'],
+    next: ['Digit2'],
+    close: ['Escape']
+  }
 };
 
-// Video skip duration in seconds (change this to your preference)
-const VIDEO_SKIP_SECONDS = 3;
+const normalizeKeyArray = (value, fallback) => {
+  if (!Array.isArray(value)) return fallback;
+  const keys = value
+    .map(item => (typeof item === 'string' ? item.trim() : ''))
+    .filter(Boolean);
+  return keys.length > 0 ? keys : fallback;
+};
+
+const normalizeAppConfig = (rawConfig) => {
+  const rawVideoSkipSeconds = Number(rawConfig?.videoSkipSeconds);
+  const videoSkipSeconds = Number.isFinite(rawVideoSkipSeconds) && rawVideoSkipSeconds > 0
+    ? rawVideoSkipSeconds
+    : DEFAULT_APP_CONFIG.videoSkipSeconds;
+
+  return {
+    videoSkipSeconds,
+    keybinds: {
+      previous: normalizeKeyArray(rawConfig?.keybinds?.previous, DEFAULT_APP_CONFIG.keybinds.previous),
+      next: normalizeKeyArray(rawConfig?.keybinds?.next, DEFAULT_APP_CONFIG.keybinds.next),
+      close: normalizeKeyArray(rawConfig?.keybinds?.close, DEFAULT_APP_CONFIG.keybinds.close)
+    }
+  };
+};
 
 // Helper to construct media URL
 const getMediaUrl = (path, thumbnail = false) => {
@@ -38,25 +62,6 @@ function Toast({ message, loading, onClose }) {
         <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
       )}
       <span>{message}</span>
-    </div>
-  );
-}
-
-// Progress Bar Component
-function ProgressBar({ current, total, currentItem }) {
-  const percentage = total > 0 ? Math.round((current / total) * 100) : 0;
-  
-  return (
-    <div className="fixed bottom-6 right-6 bg-gray-800 text-white p-4 rounded-lg shadow-lg z-[200] animate-fade-in min-w-[300px]">
-      <div className="mb-2 text-sm font-semibold">Scanning Library...</div>
-      <div className="mb-2 text-xs text-gray-400 truncate">{currentItem || 'Starting...'}</div>
-      <div className="w-full bg-gray-700 rounded-full h-2.5">
-        <div 
-          className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
-          style={{ width: `${percentage}%` }}
-        ></div>
-      </div>
-      <div className="mt-2 text-xs text-gray-300">{current} / {total} artists</div>
     </div>
   );
 }
@@ -156,7 +161,11 @@ export default function App() {
   const [items, setItems] = useState([]);
   const [totalPages, setTotalPages] = useState(1);
   const [toast, setToast] = useState(null);
-  const [scanProgress, setScanProgress] = useState(null);
+  const [isBootstrapping, setIsBootstrapping] = useState(true);
+  const [isRescanning, setIsRescanning] = useState(false);
+  const [bootstrapError, setBootstrapError] = useState('');
+  const [bootstrapRunId, setBootstrapRunId] = useState(0);
+  const [appConfig, setAppConfig] = useState(DEFAULT_APP_CONFIG);
   const videoRef = useRef(null);
   
   // Profile Management State
@@ -168,11 +177,6 @@ export default function App() {
   const storyPageIndex = searchParams.get('p') ? parseInt(searchParams.get('p')) : 0;
 
   const isFullscreen = viewerIndex !== null;
-  
-  // Fetch profiles on mount
-  useEffect(() => {
-    fetchProfiles();
-  }, []);
 
   const fetchProfiles = async () => {
     try {
@@ -183,32 +187,100 @@ export default function App() {
       console.error('Error fetching profiles:', err);
     }
   };
+
+  const fetchAppConfig = async () => {
+    try {
+      const response = await fetch('/app-config.yaml', { cache: 'no-store' });
+      if (!response.ok) {
+        throw new Error(`Failed to load app config (${response.status})`);
+      }
+
+      const yamlText = await response.text();
+      const parsed = parseYaml(yamlText);
+      setAppConfig(normalizeAppConfig(parsed));
+    } catch (err) {
+      console.error('Failed to load app-config.yaml, using defaults:', err);
+      setAppConfig(DEFAULT_APP_CONFIG);
+    }
+  };
   
   const switchProfile = async (profileName) => {
+    setIsRescanning(true);
+
     try {
-      setToast({ message: `Switching to ${profileName}...`, loading: true });
-      const res = await axios.post(`${API_URL}/profiles/switch`, { profileName });
+      setToast({ message: `Switching to ${profileName} and scanning...`, loading: true });
+      await axios.post(`${API_URL}/profiles/switch`, { profileName });
       setActiveProfile(profileName);
-      setToast({ message: `Switched to ${profileName}`, loading: false });
+      setToast({ message: `Switched to ${profileName}. Scan complete.`, loading: false });
       
       // Refresh results for new profile
       const page = parseInt(searchParams.get('page')) || 1;
       await fetchResults(query, searchParams.get('text') || '', page);
     } catch (err) {
       console.error('Error switching profile:', err);
-      setToast({ message: 'Failed to switch profile', loading: false });
+      const errorMessage = err.response?.data?.error || 'Failed to switch profile';
+      setToast({ message: errorMessage, loading: false });
+    } finally {
+      setIsRescanning(false);
     }
   };
 
   // Sync Query with URL
   useEffect(() => {
+    if (isBootstrapping) return;
+
     const q = searchParams.get('q');
     const text = searchParams.get('text');
-    if (q !== null && q !== query) setQuery(q);
-    if (text !== null && text !== textSearch) setTextSearch(text);
+    setQuery(q || '');
+    setTextSearch(text || '');
     const page = parseInt(searchParams.get('page')) || 1;
     fetchResults(q || '', text || '', page);
-  }, [searchParams]);
+  }, [searchParams, isBootstrapping]);
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    const waitForBootstrap = async () => {
+      while (!isCancelled) {
+        const res = await axios.get(`${API_URL}/bootstrap-status`);
+        const status = res.data?.status;
+
+        if (status === 'ready') {
+          return;
+        }
+
+        if (status === 'error') {
+          throw new Error(res.data?.error || 'Startup sync failed');
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+    };
+
+    const initializeApp = async () => {
+      try {
+        setBootstrapError('');
+        setIsBootstrapping(true);
+        await Promise.all([waitForBootstrap(), fetchAppConfig()]);
+        if (isCancelled) return;
+        await fetchProfiles();
+      } catch (err) {
+        if (!isCancelled) {
+          setBootstrapError(err.message || 'Failed to initialize application');
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsBootstrapping(false);
+        }
+      }
+    };
+
+    initializeApp();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [bootstrapRunId]);
 
   const fetchResults = async (tagQuery, textQuery, page) => {
     try {
@@ -235,52 +307,18 @@ export default function App() {
   };
 
   const triggerScan = async () => {
+    setIsRescanning(true);
+
     try {
-      // Show initial progress
-      setScanProgress({ current: 0, total: 0, status: 'preparing', currentItem: 'Initializing...' });
-      
-      // Connect to SSE for progress updates FIRST
-      const eventSource = new EventSource(`${API_URL}/scan/progress`);
-      
-      eventSource.onmessage = (event) => {
-        const progress = JSON.parse(event.data);
-        console.log('Progress update:', progress);
-        
-        if (progress.status === 'scanning') {
-          setScanProgress(progress);
-        } else if (progress.status === 'complete') {
-          setScanProgress(null);
-          setToast({ message: 'Scan complete! Refreshing results.', loading: false });
-          eventSource.close();
-          const page = parseInt(searchParams.get('page')) || 1;
-          fetchResults(query, searchParams.get('text') || '', page);
-        } else if (progress.status === 'error') {
-          setScanProgress(null);
-          setToast({ message: 'Scan failed', loading: false });
-          eventSource.close();
-        } else if (progress.status === 'idle') {
-          // Initial connection, just keep showing preparing state
-        }
-      };
-      
-      eventSource.onerror = (err) => {
-        console.error('SSE error:', err);
-        eventSource.close();
-        setScanProgress(null);
-        setToast({ message: 'Connection error', loading: false });
-      };
-      
-      // Wait a bit for SSE connection to establish
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      // Reset database and start scan
-      await axios.post(`${API_URL}/reset`);
       await axios.post(`${API_URL}/scan`);
-      
+      const page = parseInt(searchParams.get('page')) || 1;
+      await fetchResults(query, searchParams.get('text') || '', page);
+      setToast({ message: 'Scan complete! Results refreshed.', loading: false });
     } catch (err) {
       console.error('Scan error:', err);
       setToast({ message: 'Scan failed: ' + err.message, loading: false });
-      setScanProgress(null);
+    } finally {
+      setIsRescanning(false);
     }
   };
 
@@ -308,16 +346,16 @@ export default function App() {
     });
   };
 
-  const closeViewer = () => {
+  const closeViewer = useCallback(() => {
     setSearchParams(prev => {
       const newParams = new URLSearchParams(prev);
       newParams.delete('i');
       newParams.delete('p');
       return newParams;
     });
-  };
+  }, [setSearchParams]);
 
-  const navigateViewer = (direction, skipStory = false) => {
+  const navigateViewer = useCallback((direction, skipStory = false) => {
     if (viewerIndex === null) return;
     const currentItem = items[viewerIndex];
 
@@ -375,17 +413,26 @@ export default function App() {
         setSearchParams(prev => {
           const newParams = new URLSearchParams(prev);
           newParams.set('page', currentPage - 1);
-          // Set to last possible item (approximate, refined by effect)
-          newParams.set('i', 23); // Default limit - 1
+          // Use sentinel -1 so correction happens after the previous page has loaded.
+          newParams.set('i', '-1');
           newParams.set('p', '0');
           return newParams;
         });
       }
     }
-  };
+  }, [viewerIndex, items, storyPageIndex, searchParams, totalPages, setSearchParams]);
 
   // Auto-correct Viewer Index if items change size (e.g. prev page has fewer items)
   useEffect(() => {
+    if (items.length > 0 && viewerIndex === -1) {
+      setSearchParams(prev => {
+        const newParams = new URLSearchParams(prev);
+        newParams.set('i', String(items.length - 1));
+        return newParams;
+      });
+      return;
+    }
+
     if (items.length > 0 && viewerIndex !== null && viewerIndex >= items.length) {
       setSearchParams(prev => {
         const newParams = new URLSearchParams(prev);
@@ -393,7 +440,7 @@ export default function App() {
         return newParams;
       });
     }
-  }, [items, viewerIndex]);
+  }, [items, viewerIndex, setSearchParams]);
 
   // Keyboard support
   useEffect(() => {
@@ -410,7 +457,9 @@ export default function App() {
         e.stopImmediatePropagation();
         
         const wasPlaying = !videoElement.paused;
-        const skipAmount = e.code === 'ArrowRight' ? VIDEO_SKIP_SECONDS : -VIDEO_SKIP_SECONDS;
+        const skipAmount = e.code === 'ArrowRight'
+          ? appConfig.videoSkipSeconds
+          : -appConfig.videoSkipSeconds;
         const newTime = videoElement.currentTime + skipAmount;
         
         if (wasPlaying) {
@@ -432,24 +481,56 @@ export default function App() {
       // For all other keys, use navigation
       const skipStory = e.shiftKey;
       
-      if (NAV_KEYS.next.includes(e.code)) {
+      if (appConfig.keybinds.next.includes(e.code)) {
         e.preventDefault();
         navigateViewer(1, skipStory);
       }
-      if (NAV_KEYS.previous.includes(e.code)) {
+      if (appConfig.keybinds.previous.includes(e.code)) {
         e.preventDefault();
         navigateViewer(-1, skipStory);
       }
-      if (NAV_KEYS.close.includes(e.key)) closeViewer();
+      if (appConfig.keybinds.close.includes(e.code) || appConfig.keybinds.close.includes(e.key)) {
+        closeViewer();
+      }
     };
     // Use capture: true to intercept events before browser defaults
     window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [isFullscreen, viewerIndex, storyPageIndex, items]);
+  }, [isFullscreen, viewerIndex, storyPageIndex, items, appConfig, navigateViewer, closeViewer]);
 
   // --- RENDERERS ---
 
   const currentItem = viewerIndex !== null ? items[viewerIndex] : null;
+
+  if (isBootstrapping || isRescanning) {
+    const loadingTitle = isRescanning ? 'Syncing profile' : 'Syncing library on startup';
+
+    return (
+      <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center p-6">
+        <div className="w-full max-w-md bg-gray-800 border border-gray-700 rounded-xl p-6 text-center shadow-xl">
+          <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+          <h1 className="text-lg font-semibold mb-2">{loadingTitle}</h1>
+          {!isRescanning && bootstrapError ? (
+            <>
+              <p className="text-sm text-red-300 mb-4">{bootstrapError}</p>
+              <button
+                onClick={() => setBootstrapRunId(prev => prev + 1)}
+                className="bg-blue-600 px-4 py-2 rounded hover:bg-blue-500"
+              >
+                Retry
+              </button>
+            </>
+          ) : (
+            <p className="text-sm text-gray-300">
+              {isRescanning
+                ? 'Please wait while the server rebuilds the selected profile index.'
+                : 'Please wait while the server prepares your active profile.'}
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-6 font-sans">
@@ -570,12 +651,6 @@ export default function App() {
                     controls
                     autoPlay
                     className="w-full h-full object-contain"
-                    onLoadedMetadata={() => {
-                      // Auto-focus video when it loads
-                      if (videoRef.current) {
-                        videoRef.current.focus();
-                      }
-                    }}
                   />
                 );
               }
@@ -606,9 +681,6 @@ export default function App() {
       
       {/* TOAST NOTIFICATIONS */}
       {toast && <Toast message={toast.message} loading={toast.loading} onClose={() => setToast(null)} />}
-      
-      {/* PROGRESS BAR */}
-      {scanProgress && <ProgressBar current={scanProgress.current} total={scanProgress.total} currentItem={scanProgress.currentItem} />}
     </div>
   );
 }
