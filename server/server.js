@@ -486,140 +486,195 @@ app.post('/api/scan', async (req, res) => {
 
 // Parse tag query with AND, OR, NOT operators
 function parseTagQuery(queryString) {
-    if (!queryString) return { and: [], or: [], not: [] };
-    
+    if (typeof queryString !== 'string' || queryString.trim() === '') {
+        return { and: [], or: [], not: [] };
+    }
+
     const result = { and: [], or: [], not: [] };
-    
-    // Split by comma for AND groups, then check each part
-    const parts = queryString.split(',').map(t => t.trim()).filter(t => t !== '');
-    
+    const parts = queryString.split(',').map(t => t.trim()).filter(Boolean);
+
     for (const part of parts) {
         if (part.startsWith('-')) {
-            // NOT operator
-            result.not.push(part.substring(1).trim());
-        } else if (part.includes('|')) {
-            // OR operator - split by pipe
-            const orTags = part.split('|').map(t => t.trim()).filter(t => t !== '');
+            const notTag = part.slice(1).trim();
+            if (notTag) {
+                result.not.push(notTag);
+            }
+            continue;
+        }
+
+        if (part.includes('|')) {
+            const orTags = part.split('|').map(t => t.trim()).filter(Boolean);
             result.or.push(...orTags);
+            continue;
+        }
+
+        result.and.push(part);
+    }
+
+    return {
+        and: [...new Set(result.and)],
+        or: [...new Set(result.or)],
+        not: [...new Set(result.not)]
+    };
+}
+
+function normalizeQueryStringValue(value) {
+    if (Array.isArray(value)) {
+        return value.join(',');
+    }
+    return typeof value === 'string' ? value : '';
+}
+
+function normalizeTextQueryValue(value) {
+    if (Array.isArray(value)) {
+        return typeof value[0] === 'string' ? value[0] : '';
+    }
+    return typeof value === 'string' ? value : '';
+}
+
+function countSqlPlaceholders(sql) {
+    const matches = sql.match(/\?/g);
+    return matches ? matches.length : 0;
+}
+
+function assertSqlParamAlignment(sql, params) {
+    const expectedCount = countSqlPlaceholders(sql);
+    if (expectedCount !== params.length) {
+        const err = new Error(`Search query parameter mismatch: expected ${expectedCount}, received ${params.length}`);
+        err.statusCode = 500;
+        throw err;
+    }
+}
+
+function parseSearchPagination(rawPage, rawLimit) {
+    const pageNum = Number.parseInt(rawPage, 10);
+    const requestedLimit = Number.parseInt(rawLimit, 10);
+
+    const page = Number.isFinite(pageNum) && pageNum > 0 ? pageNum : 1;
+    const limit = Number.isFinite(requestedLimit)
+        ? clamp(requestedLimit, 1, 120)
+        : appConfig.itemsPerPage;
+
+    return {
+        page,
+        limit,
+        offset: (page - 1) * limit
+    };
+}
+
+function buildTagQueryPlan(parsedQuery) {
+    const whereClauses = [];
+    const whereParams = [];
+    const havingParams = [];
+
+    let joinClause = '';
+    let havingClause = '';
+
+    const includeTags = [...parsedQuery.and, ...parsedQuery.or];
+    if (includeTags.length > 0) {
+        joinClause = ' JOIN asset_tags at ON a.id = at.asset_id';
+
+        const includePlaceholders = includeTags.map(() => '?').join(',');
+        whereClauses.push(`at.tag IN (${includePlaceholders})`);
+        whereParams.push(...includeTags);
+
+        if (parsedQuery.and.length > 0 && parsedQuery.or.length > 0) {
+            havingClause = `GROUP BY a.id HAVING
+                COUNT(DISTINCT CASE WHEN at.tag IN (${parsedQuery.and.map(() => '?').join(',')}) THEN at.tag END) = ?
+                AND SUM(CASE WHEN at.tag IN (${parsedQuery.or.map(() => '?').join(',')}) THEN 1 ELSE 0 END) >= 1`;
+            havingParams.push(...parsedQuery.and, parsedQuery.and.length, ...parsedQuery.or);
+        } else if (parsedQuery.and.length > 0) {
+            havingClause = `GROUP BY a.id HAVING
+                COUNT(DISTINCT CASE WHEN at.tag IN (${parsedQuery.and.map(() => '?').join(',')}) THEN at.tag END) = ?`;
+            havingParams.push(...parsedQuery.and, parsedQuery.and.length);
         } else {
-            // Default AND operator
-            result.and.push(part);
+            havingClause = 'GROUP BY a.id';
         }
     }
-    
-    return result;
+
+    if (parsedQuery.not.length > 0) {
+        const notPlaceholders = parsedQuery.not.map(() => '?').join(',');
+        whereClauses.push(`a.id NOT IN (
+            SELECT asset_id FROM asset_tags WHERE tag IN (${notPlaceholders})
+        )`);
+        whereParams.push(...parsedQuery.not);
+    }
+
+    return {
+        joinClause,
+        whereClauses,
+        whereParams,
+        havingClause,
+        havingParams
+    };
+}
+
+function buildSearchQueryPlan({ rawTagQuery, rawTextQuery }) {
+    const MAX_SEARCH_TAGS = 80;
+    const MAX_SEARCH_TEXT_LENGTH = 200;
+
+    const parsedTagQuery = parseTagQuery(normalizeQueryStringValue(rawTagQuery));
+    const totalTagCount = parsedTagQuery.and.length + parsedTagQuery.or.length + parsedTagQuery.not.length;
+
+    if (totalTagCount > MAX_SEARCH_TAGS) {
+        const err = new Error(`Too many tag filters. Maximum allowed is ${MAX_SEARCH_TAGS}.`);
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const normalizedText = normalizeTextQueryValue(rawTextQuery).trim();
+    if (normalizedText.length > MAX_SEARCH_TEXT_LENGTH) {
+        const err = new Error(`Text search is too long. Maximum length is ${MAX_SEARCH_TEXT_LENGTH} characters.`);
+        err.statusCode = 400;
+        throw err;
+    }
+
+    let sql = 'SELECT DISTINCT a.*, (SELECT GROUP_CONCAT(tag) FROM asset_tags WHERE asset_id = a.id) as tags FROM assets a';
+    const params = [];
+    const whereClauses = [];
+
+    const tagPlan = buildTagQueryPlan(parsedTagQuery);
+    sql += tagPlan.joinClause;
+    whereClauses.push(...tagPlan.whereClauses);
+    params.push(...tagPlan.whereParams);
+
+    if (normalizedText) {
+        const likeQuery = `%${normalizedText}%`;
+        whereClauses.push('(a.artist LIKE ? OR a.name LIKE ?)');
+        params.push(likeQuery, likeQuery);
+    }
+
+    if (whereClauses.length > 0) {
+        sql += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+
+    if (tagPlan.havingClause) {
+        sql += ` ${tagPlan.havingClause}`;
+        params.push(...tagPlan.havingParams);
+    }
+
+    assertSqlParamAlignment(sql, params);
+
+    return {
+        sql,
+        params
+    };
 }
 
 // 3. Search
 app.get('/api/search', (req, res) => {
-    const { q, text } = req.query; // q = tags, text = artist/name query
-
-    // Clean query builder
-    let baseSql = `SELECT DISTINCT a.*, (SELECT GROUP_CONCAT(tag) FROM asset_tags WHERE asset_id = a.id) as tags FROM assets a`;
-    let params = [];
-    let whereClauses = [];
-    let havingClause = "";
-
-    // 1. Parse and handle Tags with AND/OR/NOT logic
-    if (q) {
-        const parsedQuery = parseTagQuery(q);
-        const needsJoin = parsedQuery.and.length > 0 || parsedQuery.or.length > 0;
-        
-        if (needsJoin) {
-            baseSql += ` JOIN asset_tags at ON a.id = at.asset_id`;
-        }
-        
-        // Handle AND tags (must have ALL)
-        if (parsedQuery.and.length > 0) {
-            const placeholders = parsedQuery.and.map(() => '?').join(',');
-            whereClauses.push(`at.tag IN (${placeholders})`);
-            params.push(...parsedQuery.and);
-            
-            // HAVING clause to ensure ALL AND tags are present
-            havingClause = `GROUP BY a.id HAVING COUNT(DISTINCT at.tag) >= ?`;
-        }
-        
-        // Handle OR tags (must have AT LEAST ONE)
-        if (parsedQuery.or.length > 0) {
-            if (parsedQuery.and.length === 0) {
-                // If no AND tags, we need a simpler query
-                const placeholders = parsedQuery.or.map(() => '?').join(',');
-                whereClauses.push(`at.tag IN (${placeholders})`);
-                params.push(...parsedQuery.or);
-                
-                if (!havingClause) {
-                    havingClause = `GROUP BY a.id`;
-                }
-            } else {
-                // If we have both AND and OR, use subquery approach
-                const orPlaceholders = parsedQuery.or.map(() => '?').join(',');
-                whereClauses.push(`(at.tag IN (${[...parsedQuery.and.map(() => '?'), ...parsedQuery.or.map(() => '?')].join(',')}))`);
-                // We already pushed AND tags, now push OR tags
-                params.push(...parsedQuery.or);
-                
-                // Modify HAVING to require AND tags + at least one OR tag
-                havingClause = `GROUP BY a.id HAVING 
-                    SUM(CASE WHEN at.tag IN (${parsedQuery.and.map(() => '?').join(',')}) THEN 1 ELSE 0 END) = ? 
-                    ${parsedQuery.or.length > 0 ? `AND SUM(CASE WHEN at.tag IN (${parsedQuery.or.map(() => '?').join(',')}) THEN 1 ELSE 0 END) >= 1` : ''}`;
-            }
-        }
-        
-        // Handle NOT tags (must NOT have ANY)
-        if (parsedQuery.not.length > 0) {
-            const notPlaceholders = parsedQuery.not.map(() => '?').join(',');
-            whereClauses.push(`a.id NOT IN (
-                SELECT asset_id FROM asset_tags WHERE tag IN (${notPlaceholders})
-            )`);
-            params.push(...parsedQuery.not);
-        }
-    }
-
-    // 2. Filter by Text (Artist OR Name)
-    if (text) {
-        whereClauses.push(`(a.artist LIKE ? OR a.name LIKE ?)`);
-        const likeQuery = `%${text}%`;
-        params.push(likeQuery, likeQuery);
-    }
-
-    // 3. Assemble WHERE clause
-    if (whereClauses.length > 0) {
-        baseSql += ` WHERE ${whereClauses.join(' AND ')}`;
-    }
-
-    // 4. Append HAVING clause and its parameters
-    if (havingClause) {
-        baseSql += ` ${havingClause}`;
-        
-        // Add parameters for HAVING clause
-        if (q) {
-            const parsedQuery = parseTagQuery(q);
-            if (parsedQuery.and.length > 0 && parsedQuery.or.length > 0) {
-                // Complex case with both AND and OR
-                params.push(...parsedQuery.and); // For first CASE check
-                params.push(parsedQuery.and.length); // For count
-                if (parsedQuery.or.length > 0) {
-                    params.push(...parsedQuery.or); // For second CASE check
-                }
-            } else if (parsedQuery.and.length > 0) {
-                // Only AND tags
-                params.push(parsedQuery.and.length);
-            }
-            // OR only doesn't need extra params
-        }
-    }
-
     try {
+        const queryPlan = buildSearchQueryPlan({
+            rawTagQuery: req.query.q,
+            rawTextQuery: req.query.text
+        });
+
         // --- SORTING & PAGINATION LOGIC ---
         // Note: We sort in JavaScript with natural sort instead of SQL to handle numeric filenames correctly
-        const page = parseInt(req.query.page) || 1;
-        const requestedLimit = parseInt(req.query.limit);
-        const limit = Number.isFinite(requestedLimit)
-            ? clamp(requestedLimit, 1, 120)
-            : appConfig.itemsPerPage;
-        const offset = (page - 1) * limit;
+        const { page, limit, offset } = parseSearchPagination(req.query.page, req.query.limit);
 
         // 1. Get ALL results (no ORDER BY, LIMIT, or OFFSET yet)
-        const rows = db.prepare(baseSql).all(...params);
+        const rows = db.prepare(queryPlan.sql).all(...queryPlan.params);
 
         // 2. Parse pages JSON and tags CSV
         const parsedItems = rows.map(r => ({
@@ -652,7 +707,8 @@ app.get('/api/search', (req, res) => {
         });
     } catch (err) {
         console.error("Search Error:", err);
-        res.status(500).json({ error: err.message });
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
     }
 });
 

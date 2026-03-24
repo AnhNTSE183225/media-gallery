@@ -726,7 +726,7 @@ export default function App() {
         <div className="fixed inset-0 bg-black z-[100] flex flex-col h-screen w-screen overflow-hidden">
 
           {/* Top Bar - Now absolute and fades out or stays on top */}
-          <div className="absolute top-0 left-0 right-0 p-4 flex justify-between bg-gradient-to-b from-black/80 to-transparent z-20 pointer-events-none">
+          <div className="absolute top-0 left-0 right-0 p-4 flex justify-between z-20 pointer-events-none">
             <div className="pointer-events-auto">
               <h2 className="text-xl font-bold text-white drop-shadow-md">{currentItem.artist} / {currentItem.name}</h2>
               {currentItem.type === 'story' && (
