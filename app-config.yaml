@@ -1,4 +1,9 @@
-videoSkipSeconds: 3
+pagination:
+  itemsPerPage: 18
+
+viewer:
+  videoSkipSeconds: 3
+
 keybinds:
   previous:
     - Digit1

@@ -4,13 +4,67 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
+const { load: parseYaml } = require('js-yaml');
 
 const app = express();
 const PORT = 3001;
+const APP_CONFIG_PATH = path.resolve(__dirname, '..', 'app-config.yaml');
+const DEFAULT_APP_CONFIG = {
+    itemsPerPage: 12,
+    videoSkipSeconds: 3,
+    keybinds: {
+        previous: ['Digit1'],
+        next: ['Digit2'],
+        close: ['Escape']
+    }
+};
+
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function normalizeKeyArray(value, fallback) {
+    if (!Array.isArray(value)) return fallback;
+    const keys = value
+        .map(item => (typeof item === 'string' ? item.trim() : ''))
+        .filter(Boolean);
+    return keys.length > 0 ? keys : fallback;
+}
+
+function normalizeAppConfig(rawConfig) {
+    const rawItemsPerPage = Number(rawConfig?.pagination?.itemsPerPage);
+    const rawVideoSkipSeconds = Number(rawConfig?.viewer?.videoSkipSeconds);
+
+    return {
+        itemsPerPage: Number.isFinite(rawItemsPerPage)
+            ? clamp(Math.floor(rawItemsPerPage), 1, 120)
+            : DEFAULT_APP_CONFIG.itemsPerPage,
+        videoSkipSeconds: Number.isFinite(rawVideoSkipSeconds) && rawVideoSkipSeconds > 0
+            ? rawVideoSkipSeconds
+            : DEFAULT_APP_CONFIG.videoSkipSeconds,
+        keybinds: {
+            previous: normalizeKeyArray(rawConfig?.keybinds?.previous, DEFAULT_APP_CONFIG.keybinds.previous),
+            next: normalizeKeyArray(rawConfig?.keybinds?.next, DEFAULT_APP_CONFIG.keybinds.next),
+            close: normalizeKeyArray(rawConfig?.keybinds?.close, DEFAULT_APP_CONFIG.keybinds.close)
+        }
+    };
+}
+
+function loadAppConfig() {
+    try {
+        const yamlText = fs.readFileSync(APP_CONFIG_PATH, 'utf8');
+        const parsed = parseYaml(yamlText);
+        return normalizeAppConfig(parsed);
+    } catch (err) {
+        console.warn(`Failed to load ${APP_CONFIG_PATH}. Using defaults.`, err.message);
+        return { ...DEFAULT_APP_CONFIG };
+    }
+}
 
 // --- PROFILE MANAGEMENT ---
 let config = require('./config.json');
 let activeProfileName = config.activeProfile || Object.keys(config.profiles)[0];
+let appConfig = loadAppConfig();
 let db = null;
 
 // Get current active profile configuration
@@ -80,6 +134,41 @@ let bootstrapStatus = {
     error: null,
     message: 'Startup sync has not started yet.'
 };
+const MAX_SCAN_LOG_ENTRIES = 60;
+let scanStatus = {
+    status: 'idle',
+    profile: activeProfileName,
+    processedArtists: 0,
+    totalArtists: 0,
+    percentage: 0,
+    currentArtist: '',
+    startedAt: null,
+    finishedAt: null,
+    error: null,
+    recentLogs: []
+};
+
+function appendScanLog(line) {
+    scanStatus.recentLogs.push(line);
+    if (scanStatus.recentLogs.length > MAX_SCAN_LOG_ENTRIES) {
+        scanStatus.recentLogs.shift();
+    }
+}
+
+function setScanStatusRunning(profileName, totalArtists) {
+    scanStatus = {
+        status: 'running',
+        profile: profileName,
+        processedArtists: 0,
+        totalArtists,
+        percentage: totalArtists === 0 ? 100 : 0,
+        currentArtist: '',
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        error: null,
+        recentLogs: []
+    };
+}
 
 function countArtists(dirPath) {
     if (!fs.existsSync(dirPath)) return 0;
@@ -104,11 +193,16 @@ function logScanProgress(scanContext, artistName) {
     scanContext.processedArtists += 1;
     const percentage = Math.floor((scanContext.processedArtists / scanContext.totalArtists) * 100);
 
+    scanStatus.processedArtists = scanContext.processedArtists;
+    scanStatus.totalArtists = scanContext.totalArtists;
+    scanStatus.percentage = percentage;
+    scanStatus.currentArtist = artistName;
+
     if (percentage > scanContext.lastLoggedPercent || scanContext.processedArtists === scanContext.totalArtists) {
         scanContext.lastLoggedPercent = percentage;
-        console.log(
-            `[Scan][${activeProfileName}] ${percentage}% (${scanContext.processedArtists}/${scanContext.totalArtists}) - ${artistName}`
-        );
+        const line = `[Scan][${activeProfileName}] ${percentage}% (${scanContext.processedArtists}/${scanContext.totalArtists}) - ${artistName}`;
+        appendScanLog(line);
+        console.log(line);
     }
 }
 
@@ -223,6 +317,8 @@ async function runScanJob({ updateBootstrapStatus = false } = {}) {
         clearDatabase();
         const rootDirectory = getActiveProfile().rootDirectory;
         const totalArtists = countArtists(rootDirectory);
+        setScanStatusRunning(activeProfileName, totalArtists);
+
         const scanContext = {
             totalArtists,
             processedArtists: 0,
@@ -230,13 +326,29 @@ async function runScanJob({ updateBootstrapStatus = false } = {}) {
         };
 
         if (totalArtists === 0) {
-            console.log(`[Scan][${activeProfileName}] 100% (0/0) - No artist folders found`);
+            const line = `[Scan][${activeProfileName}] 100% (0/0) - No artist folders found`;
+            appendScanLog(line);
+            console.log(line);
         } else {
-            console.log(`[Scan][${activeProfileName}] 0% (0/${totalArtists}) - Starting scan`);
+            const line = `[Scan][${activeProfileName}] 0% (0/${totalArtists}) - Starting scan`;
+            appendScanLog(line);
+            console.log(line);
         }
 
         await scanDirectory(rootDirectory, null, [], scanContext);
-        console.log(`[Scan][${activeProfileName}] 100% (${scanContext.processedArtists}/${totalArtists}) - Scan complete`);
+
+        const completionLine = `[Scan][${activeProfileName}] 100% (${scanContext.processedArtists}/${totalArtists}) - Scan complete`;
+        scanStatus = {
+            ...scanStatus,
+            status: 'complete',
+            processedArtists: scanContext.processedArtists,
+            totalArtists,
+            percentage: 100,
+            finishedAt: new Date().toISOString(),
+            error: null
+        };
+        appendScanLog(completionLine);
+        console.log(completionLine);
 
         if (updateBootstrapStatus) {
             bootstrapStatus = {
@@ -249,6 +361,14 @@ async function runScanJob({ updateBootstrapStatus = false } = {}) {
             };
         }
     } catch (err) {
+        scanStatus = {
+            ...scanStatus,
+            status: 'error',
+            finishedAt: new Date().toISOString(),
+            error: err.message
+        };
+        appendScanLog(`[Scan][${activeProfileName}] ERROR - ${err.message}`);
+
         if (updateBootstrapStatus) {
             bootstrapStatus = {
                 status: 'error',
@@ -335,6 +455,19 @@ app.get('/api/bootstrap-status', (req, res) => {
         ...bootstrapStatus,
         isScanning
     });
+});
+
+// 1a. Scan Status
+app.get('/api/scan/status', (req, res) => {
+    res.json({
+        ...scanStatus,
+        isScanning
+    });
+});
+
+// 1b. App Config
+app.get('/api/app-config', (req, res) => {
+    res.json(appConfig);
 });
 
 // 2. Trigger Scan
@@ -479,7 +612,10 @@ app.get('/api/search', (req, res) => {
         // --- SORTING & PAGINATION LOGIC ---
         // Note: We sort in JavaScript with natural sort instead of SQL to handle numeric filenames correctly
         const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 12; // Default 12 items per page for better performance
+        const requestedLimit = parseInt(req.query.limit);
+        const limit = Number.isFinite(requestedLimit)
+            ? clamp(requestedLimit, 1, 120)
+            : appConfig.itemsPerPage;
         const offset = (page - 1) * limit;
 
         // 1. Get ALL results (no ORDER BY, LIMIT, or OFFSET yet)

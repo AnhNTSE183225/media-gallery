@@ -2,17 +2,27 @@ import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
 import axios from 'axios';
 import { useSearchParams } from 'react-router-dom';
 import { Book, ArrowLeft, ArrowRight, X } from 'lucide-react';
-import { load as parseYaml } from 'js-yaml';
 
 const API_URL = 'http://localhost:3001/api';
 
 const DEFAULT_APP_CONFIG = {
+  itemsPerPage: 12,
   videoSkipSeconds: 3,
   keybinds: {
     previous: ['Digit1'],
     next: ['Digit2'],
     close: ['Escape']
   }
+};
+
+const DEFAULT_SCAN_STATUS = {
+  status: 'idle',
+  profile: '',
+  processedArtists: 0,
+  totalArtists: 0,
+  percentage: 0,
+  currentArtist: '',
+  recentLogs: []
 };
 
 const normalizeKeyArray = (value, fallback) => {
@@ -24,12 +34,19 @@ const normalizeKeyArray = (value, fallback) => {
 };
 
 const normalizeAppConfig = (rawConfig) => {
+  const rawItemsPerPage = Number(rawConfig?.itemsPerPage);
   const rawVideoSkipSeconds = Number(rawConfig?.videoSkipSeconds);
+
+  const itemsPerPage = Number.isFinite(rawItemsPerPage) && rawItemsPerPage > 0
+    ? Math.floor(rawItemsPerPage)
+    : DEFAULT_APP_CONFIG.itemsPerPage;
+
   const videoSkipSeconds = Number.isFinite(rawVideoSkipSeconds) && rawVideoSkipSeconds > 0
     ? rawVideoSkipSeconds
     : DEFAULT_APP_CONFIG.videoSkipSeconds;
 
   return {
+    itemsPerPage,
     videoSkipSeconds,
     keybinds: {
       previous: normalizeKeyArray(rawConfig?.keybinds?.previous, DEFAULT_APP_CONFIG.keybinds.previous),
@@ -111,7 +128,7 @@ const GalleryItem = memo(({ item, idx, onOpen }) => {
       onClick={() => onOpen(idx)}
       className="relative group cursor-pointer border border-gray-700 rounded overflow-hidden bg-gray-800"
     >
-      <div className="aspect-[2/3] overflow-hidden bg-black flex items-center justify-center">
+      <div className="aspect-[3/4] overflow-hidden bg-black flex items-center justify-center">
         {isVisible ? (
           isVideo ? (
             <video
@@ -166,6 +183,7 @@ export default function App() {
   const [bootstrapError, setBootstrapError] = useState('');
   const [bootstrapRunId, setBootstrapRunId] = useState(0);
   const [appConfig, setAppConfig] = useState(DEFAULT_APP_CONFIG);
+  const [scanStatus, setScanStatus] = useState(DEFAULT_SCAN_STATUS);
   const videoRef = useRef(null);
   
   // Profile Management State
@@ -190,19 +208,26 @@ export default function App() {
 
   const fetchAppConfig = async () => {
     try {
-      const response = await fetch('/app-config.yaml', { cache: 'no-store' });
-      if (!response.ok) {
-        throw new Error(`Failed to load app config (${response.status})`);
-      }
-
-      const yamlText = await response.text();
-      const parsed = parseYaml(yamlText);
-      setAppConfig(normalizeAppConfig(parsed));
+      const res = await axios.get(`${API_URL}/app-config`);
+      setAppConfig(normalizeAppConfig(res.data));
     } catch (err) {
-      console.error('Failed to load app-config.yaml, using defaults:', err);
+      console.error('Failed to load app config from backend, using defaults:', err);
       setAppConfig(DEFAULT_APP_CONFIG);
     }
   };
+
+  const fetchScanStatus = useCallback(async () => {
+    try {
+      const res = await axios.get(`${API_URL}/scan/status`);
+      setScanStatus({
+        ...DEFAULT_SCAN_STATUS,
+        ...res.data,
+        recentLogs: Array.isArray(res.data?.recentLogs) ? res.data.recentLogs : []
+      });
+    } catch {
+      // Keep existing status on transient polling failures.
+    }
+  }, []);
   
   const switchProfile = async (profileName) => {
     setIsRescanning(true);
@@ -225,6 +250,23 @@ export default function App() {
     }
   };
 
+  const fetchResults = useCallback(async (tagQuery, textQuery, page) => {
+    try {
+      const res = await axios.get(`${API_URL}/search`, {
+        params: {
+          q: tagQuery,
+          text: textQuery,
+          page,
+          limit: appConfig.itemsPerPage
+        }
+      });
+      setItems(res.data.items || []);
+      setTotalPages(res.data.pagination?.totalPages || 1);
+    } catch (err) {
+      console.error(err);
+    }
+  }, [appConfig.itemsPerPage]);
+
   // Sync Query with URL
   useEffect(() => {
     if (isBootstrapping) return;
@@ -235,7 +277,7 @@ export default function App() {
     setTextSearch(text || '');
     const page = parseInt(searchParams.get('page')) || 1;
     fetchResults(q || '', text || '', page);
-  }, [searchParams, isBootstrapping]);
+  }, [searchParams, isBootstrapping, fetchResults]);
 
   useEffect(() => {
     let isCancelled = false;
@@ -282,15 +324,25 @@ export default function App() {
     };
   }, [bootstrapRunId]);
 
-  const fetchResults = async (tagQuery, textQuery, page) => {
-    try {
-      const res = await axios.get(`${API_URL}/search`, { params: { q: tagQuery, text: textQuery, page } });
-      setItems(res.data.items || []);
-      setTotalPages(res.data.pagination?.totalPages || 1);
-    } catch (err) {
-      console.error(err);
-    }
-  };
+  useEffect(() => {
+    if (!isBootstrapping && !isRescanning) return;
+
+    let isCancelled = false;
+
+    const run = async () => {
+      if (!isCancelled) {
+        await fetchScanStatus();
+      }
+    };
+
+    run();
+    const interval = setInterval(run, 800);
+
+    return () => {
+      isCancelled = true;
+      clearInterval(interval);
+    };
+  }, [isBootstrapping, isRescanning, fetchScanStatus]);
 
   const handleSearch = (e) => {
     e.preventDefault();
@@ -501,15 +553,33 @@ export default function App() {
   // --- RENDERERS ---
 
   const currentItem = viewerIndex !== null ? items[viewerIndex] : null;
+  const currentPage = parseInt(searchParams.get('page')) || 1;
 
   if (isBootstrapping || isRescanning) {
     const loadingTitle = isRescanning ? 'Syncing profile' : 'Syncing library on startup';
+    const recentLogs = scanStatus.recentLogs.slice(-8).reverse();
+    const percentage = Number.isFinite(scanStatus.percentage) ? scanStatus.percentage : 0;
 
     return (
       <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center p-6">
-        <div className="w-full max-w-md bg-gray-800 border border-gray-700 rounded-xl p-6 text-center shadow-xl">
+        <div className="w-full max-w-2xl bg-gray-800 border border-gray-700 rounded-xl p-6 text-center shadow-xl">
           <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
           <h1 className="text-lg font-semibold mb-2">{loadingTitle}</h1>
+          <p className="text-sm text-gray-400 mb-3">
+            {scanStatus.profile ? `Profile: ${scanStatus.profile}` : 'Preparing scan context...'}
+          </p>
+          <div className="w-full bg-gray-700 rounded-full h-2.5 mb-2 overflow-hidden">
+            <div
+              className="bg-blue-600 h-full transition-all duration-300"
+              style={{ width: `${Math.max(0, Math.min(100, percentage))}%` }}
+            ></div>
+          </div>
+          <p className="text-xs text-gray-400 mb-3">
+            {scanStatus.processedArtists} / {scanStatus.totalArtists} artists ({percentage}%)
+          </p>
+          {scanStatus.currentArtist && (
+            <p className="text-sm text-blue-300 truncate mb-4">Current: {scanStatus.currentArtist}</p>
+          )}
           {!isRescanning && bootstrapError ? (
             <>
               <p className="text-sm text-red-300 mb-4">{bootstrapError}</p>
@@ -527,17 +597,29 @@ export default function App() {
                 : 'Please wait while the server prepares your active profile.'}
             </p>
           )}
+          {recentLogs.length > 0 && (
+            <div className="mt-4 text-left">
+              <p className="text-xs text-gray-400 mb-2">Recent logs</p>
+              <div className="max-h-44 overflow-auto rounded border border-gray-700 bg-gray-900/70 p-2 text-xs font-mono text-gray-200">
+                {recentLogs.map((line, index) => (
+                  <div key={`${index}-${line}`} className="whitespace-pre-wrap break-words mb-1 last:mb-0">
+                    {line}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white p-6 font-sans">
+    <div className="min-h-screen bg-gray-900 text-white p-4 lg:p-5 font-sans">
 
       {/* HEADER */}
-      <div className="mb-6">
-        <div className="flex gap-4 mb-2">
+      <div className="mb-4">
+        <div className="flex gap-3 mb-2">
           {/* Profile Selector */}
           {profiles.length > 0 && (
             <select 
@@ -553,31 +635,55 @@ export default function App() {
           <button onClick={triggerScan} className="bg-blue-600 px-4 py-2 rounded hover:bg-blue-500">
             Rescan Library
           </button>
-          <form onSubmit={handleSearch} className="flex-1 flex gap-2">
-            {/* Text Search (Artist/Name) */}
-            <input
-              type="text"
-              name="text"
-              value={textSearch}
-              onChange={(e) => setTextSearch(e.target.value)}
-              placeholder="Search Artist / Story Name..."
-              className="w-1/3 p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
-            />
-            {/* Tag Search */}
-            <input
-              type="text"
-              name="q"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search tags (e.g., tag1,tag2 | tag3|tag4 | -tag5)..."
-              className="flex-1 p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
-            />
-            <button type="submit" className="hidden">Search</button>
-          </form>
+          <div className="flex-1 flex gap-2 min-w-0">
+            <form onSubmit={handleSearch} className="flex-1 flex gap-2 min-w-0">
+              {/* Text Search (Artist/Name) */}
+              <input
+                type="text"
+                name="text"
+                value={textSearch}
+                onChange={(e) => setTextSearch(e.target.value)}
+                placeholder="Search Artist / Story Name..."
+                className="w-1/3 min-w-[180px] p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
+              />
+              {/* Tag Search */}
+              <input
+                type="text"
+                name="q"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search tags (e.g., tag1,tag2 | tag3|tag4 | -tag5)..."
+                className="flex-1 min-w-0 p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
+              />
+              <button type="submit" className="hidden">Search</button>
+            </form>
+
+            {totalPages > 1 && (
+              <div className="hidden lg:flex items-center gap-2 px-2 py-1 bg-gray-800 rounded border border-gray-700 whitespace-nowrap">
+                <button
+                  onClick={() => handlePageChange(currentPage - 1)}
+                  disabled={currentPage === 1}
+                  className="px-3 py-1.5 bg-gray-700 rounded disabled:opacity-50 hover:bg-gray-600"
+                >
+                  Previous
+                </button>
+                <span className="text-xs text-gray-300 px-1">
+                  Page {currentPage} of {totalPages}
+                </span>
+                <button
+                  onClick={() => handlePageChange(currentPage + 1)}
+                  disabled={currentPage === totalPages}
+                  className="px-3 py-1.5 bg-gray-700 rounded disabled:opacity-50 hover:bg-gray-600"
+                >
+                  Next
+                </button>
+              </div>
+            )}
+          </div>
         </div>
         
         {/* Search Help Text */}
-        <div className="text-xs text-gray-500 ml-auto pl-32">
+        <div className="text-[11px] text-gray-500 ml-auto pl-24">
           <span className="font-semibold text-gray-400">Tag operators:</span> 
           <span className="ml-2"><code className="bg-gray-800 px-1 py-0.5 rounded">tag1,tag2</code> = AND (both required)</span>
           <span className="ml-3"><code className="bg-gray-800 px-1 py-0.5 rounded">tag1|tag2</code> = OR (at least one)</span>
@@ -586,7 +692,7 @@ export default function App() {
       </div>
 
       {/* GALLERY GRID */}
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 xl:grid-cols-8 2xl:grid-cols-9 gap-3">
         {items.map((item, idx) => (
           <GalleryItem key={item.id} item={item} idx={idx} onOpen={openViewer} />
         ))}
@@ -596,18 +702,18 @@ export default function App() {
       {totalPages > 1 && (
         <div className="flex justify-center items-center gap-4 mt-8 mb-4">
           <button
-            onClick={() => handlePageChange((parseInt(searchParams.get('page')) || 1) - 1)}
-            disabled={(parseInt(searchParams.get('page')) || 1) === 1}
+            onClick={() => handlePageChange(currentPage - 1)}
+            disabled={currentPage === 1}
             className="px-4 py-2 bg-gray-800 rounded disabled:opacity-50 hover:bg-gray-700"
           >
             Previous
           </button>
           <span className="text-gray-400">
-            Page {parseInt(searchParams.get('page')) || 1} of {totalPages}
+            Page {currentPage} of {totalPages}
           </span>
           <button
-            onClick={() => handlePageChange((parseInt(searchParams.get('page')) || 1) + 1)}
-            disabled={(parseInt(searchParams.get('page')) || 1) === totalPages}
+            onClick={() => handlePageChange(currentPage + 1)}
+            disabled={currentPage === totalPages}
             className="px-4 py-2 bg-gray-800 rounded disabled:opacity-50 hover:bg-gray-700"
           >
             Next
