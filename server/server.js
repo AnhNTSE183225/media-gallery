@@ -485,17 +485,34 @@ app.post('/api/scan', async (req, res) => {
 });
 
 // Parse tag query with AND, OR, NOT operators
+function normalizeTagToken(value) {
+    if (typeof value !== 'string') return '';
+    return value
+        .replace(/[\u200B-\u200D\uFEFF]/g, '')
+        .trim()
+        .toLowerCase();
+}
+
+function isNegationToken(value) {
+    if (typeof value !== 'string' || value.length === 0) return false;
+    const firstChar = value[0];
+    return firstChar === '-' || firstChar === '−' || firstChar === '–' || firstChar === '—';
+}
+
 function parseTagQuery(queryString) {
     if (typeof queryString !== 'string' || queryString.trim() === '') {
         return { and: [], or: [], not: [] };
     }
 
     const result = { and: [], or: [], not: [] };
-    const parts = queryString.split(',').map(t => t.trim()).filter(Boolean);
+    const normalizedQuery = queryString
+        .replace(/[，、؛]/g, ',')
+        .replace(/[\u200B-\u200D\uFEFF]/g, '');
+    const parts = normalizedQuery.split(',').map(t => t.trim()).filter(Boolean);
 
     for (const part of parts) {
-        if (part.startsWith('-')) {
-            const notTag = part.slice(1).trim();
+        if (isNegationToken(part)) {
+            const notTag = normalizeTagToken(part.slice(1));
             if (notTag) {
                 result.not.push(notTag);
             }
@@ -503,12 +520,18 @@ function parseTagQuery(queryString) {
         }
 
         if (part.includes('|')) {
-            const orTags = part.split('|').map(t => t.trim()).filter(Boolean);
+            const orTags = part
+                .split('|')
+                .map(t => normalizeTagToken(t))
+                .filter(Boolean);
             result.or.push(...orTags);
             continue;
         }
 
-        result.and.push(part);
+        const andTag = normalizeTagToken(part);
+        if (andTag) {
+            result.and.push(andTag);
+        }
     }
 
     return {
@@ -575,17 +598,17 @@ function buildTagQueryPlan(parsedQuery) {
         joinClause = ' JOIN asset_tags at ON a.id = at.asset_id';
 
         const includePlaceholders = includeTags.map(() => '?').join(',');
-        whereClauses.push(`at.tag IN (${includePlaceholders})`);
+        whereClauses.push(`LOWER(TRIM(at.tag)) IN (${includePlaceholders})`);
         whereParams.push(...includeTags);
 
         if (parsedQuery.and.length > 0 && parsedQuery.or.length > 0) {
             havingClause = `GROUP BY a.id HAVING
-                COUNT(DISTINCT CASE WHEN at.tag IN (${parsedQuery.and.map(() => '?').join(',')}) THEN at.tag END) = ?
-                AND SUM(CASE WHEN at.tag IN (${parsedQuery.or.map(() => '?').join(',')}) THEN 1 ELSE 0 END) >= 1`;
+                COUNT(DISTINCT CASE WHEN LOWER(TRIM(at.tag)) IN (${parsedQuery.and.map(() => '?').join(',')}) THEN LOWER(TRIM(at.tag)) END) = ?
+                AND SUM(CASE WHEN LOWER(TRIM(at.tag)) IN (${parsedQuery.or.map(() => '?').join(',')}) THEN 1 ELSE 0 END) >= 1`;
             havingParams.push(...parsedQuery.and, parsedQuery.and.length, ...parsedQuery.or);
         } else if (parsedQuery.and.length > 0) {
             havingClause = `GROUP BY a.id HAVING
-                COUNT(DISTINCT CASE WHEN at.tag IN (${parsedQuery.and.map(() => '?').join(',')}) THEN at.tag END) = ?`;
+                COUNT(DISTINCT CASE WHEN LOWER(TRIM(at.tag)) IN (${parsedQuery.and.map(() => '?').join(',')}) THEN LOWER(TRIM(at.tag)) END) = ?`;
             havingParams.push(...parsedQuery.and, parsedQuery.and.length);
         } else {
             havingClause = 'GROUP BY a.id';
@@ -595,7 +618,7 @@ function buildTagQueryPlan(parsedQuery) {
     if (parsedQuery.not.length > 0) {
         const notPlaceholders = parsedQuery.not.map(() => '?').join(',');
         whereClauses.push(`a.id NOT IN (
-            SELECT asset_id FROM asset_tags WHERE tag IN (${notPlaceholders})
+            SELECT asset_id FROM asset_tags WHERE LOWER(TRIM(tag)) IN (${notPlaceholders})
         )`);
         whereParams.push(...parsedQuery.not);
     }
@@ -657,7 +680,9 @@ function buildSearchQueryPlan({ rawTagQuery, rawTextQuery }) {
 
     return {
         sql,
-        params
+        params,
+        parsedTagQuery,
+        normalizedText
     };
 }
 
@@ -667,6 +692,15 @@ app.get('/api/search', (req, res) => {
         const queryPlan = buildSearchQueryPlan({
             rawTagQuery: req.query.q,
             rawTextQuery: req.query.text
+        });
+
+        // Temporary debug log for validating parser behavior across query formats.
+        console.log('[Search][Debug] Parsed query:', {
+            rawQ: normalizeQueryStringValue(req.query.q),
+            and: queryPlan.parsedTagQuery.and,
+            or: queryPlan.parsedTagQuery.or,
+            not: queryPlan.parsedTagQuery.not,
+            text: queryPlan.normalizedText
         });
 
         // --- SORTING & PAGINATION LOGIC ---
