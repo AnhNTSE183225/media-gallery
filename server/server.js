@@ -79,6 +79,22 @@ function getDbFileName(profileName) {
     return `library_${safeName}.db`;
 }
 
+function decideScanMode({ allowFastSkip, lastIndexedFileCount, currentIndexedFileCount }) {
+    if (!allowFastSkip) {
+        return { shouldSkipFullScan: false, reason: 'fast-skip-disabled' };
+    }
+
+    if (!Number.isInteger(lastIndexedFileCount)) {
+        return { shouldSkipFullScan: false, reason: 'no-previous-metadata' };
+    }
+
+    if (lastIndexedFileCount !== currentIndexedFileCount) {
+        return { shouldSkipFullScan: false, reason: 'file-count-changed' };
+    }
+
+    return { shouldSkipFullScan: true, reason: 'file-count-unchanged' };
+}
+
 // Prepared statements (will be initialized with database)
 let insertAsset;
 let insertTag;
@@ -109,13 +125,37 @@ function initDatabase() {
       CREATE TABLE IF NOT EXISTS asset_tags (
         asset_id INTEGER,
         tag TEXT,
-        FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
-      );
+                FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS scan_metadata (
+                profile TEXT PRIMARY KEY,
+                last_indexed_file_count INTEGER NOT NULL,
+                last_successful_scan_at DATETIME NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_assets_artist_name ON assets(artist, name);
+            CREATE INDEX IF NOT EXISTS idx_asset_tags_tag ON asset_tags(tag);
+            CREATE INDEX IF NOT EXISTS idx_asset_tags_asset_tag ON asset_tags(asset_id, tag);
     `);
     
     // Create/recreate prepared statements for the new database connection
     insertAsset = db.prepare(`INSERT OR REPLACE INTO assets (path, type, artist, name, pages) VALUES (?, ?, ?, ?, ?)`);
     insertTag = db.prepare(`INSERT INTO asset_tags (asset_id, tag) VALUES (?, ?)`);
+}
+
+function getScanMetadata(profileName) {
+    return db
+        .prepare('SELECT profile, last_indexed_file_count, last_successful_scan_at FROM scan_metadata WHERE profile = ?')
+        .get(profileName) || null;
+}
+
+function upsertScanMetadata(profileName, indexedFileCount) {
+    db.prepare(`
+        INSERT INTO scan_metadata (profile, last_indexed_file_count, last_successful_scan_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(profile) DO UPDATE SET
+            last_indexed_file_count = excluded.last_indexed_file_count,
+            last_successful_scan_at = CURRENT_TIMESTAMP
+    `).run(profileName, indexedFileCount);
 }
 
 // Initialize on startup
@@ -227,6 +267,47 @@ function getFilesRecursively(dir) {
     return results.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
 }
 
+function countIndexableFiles(dirPath, allowedExtensions) {
+    if (!fs.existsSync(dirPath)) return 0;
+
+    const extensions = new Set((allowedExtensions || []).map(ext => ext.toLowerCase()));
+    const stack = [dirPath];
+    let count = 0;
+
+    while (stack.length > 0) {
+        const currentDir = stack.pop();
+        let items;
+
+        try {
+            items = fs.readdirSync(currentDir);
+        } catch (err) {
+            continue;
+        }
+
+        for (const item of items) {
+            const fullPath = path.join(currentDir, item);
+            let stat;
+
+            try {
+                stat = fs.statSync(fullPath);
+            } catch (err) {
+                continue;
+            }
+
+            if (stat.isDirectory()) {
+                stack.push(fullPath);
+                continue;
+            }
+
+            if (extensions.has(path.extname(item).toLowerCase())) {
+                count += 1;
+            }
+        }
+    }
+
+    return count;
+}
+
 async function scanDirectory(dirPath, artistName = null, currentTags = [], scanContext = null) {
     if (!fs.existsSync(dirPath)) return;
 
@@ -294,7 +375,7 @@ function clearDatabase() {
     db.prepare('DELETE FROM assets').run();
 }
 
-async function runScanJob({ updateBootstrapStatus = false } = {}) {
+async function runScanJob({ updateBootstrapStatus = false, allowFastSkip = false, trigger = 'manual' } = {}) {
     if (isScanning) {
         const error = new Error('A scan is already running');
         error.statusCode = 409;
@@ -314,8 +395,59 @@ async function runScanJob({ updateBootstrapStatus = false } = {}) {
     }
 
     try {
-        clearDatabase();
         const rootDirectory = getActiveProfile().rootDirectory;
+        const allowedExtensions = getActiveProfile().allowedExtensions;
+        const currentIndexedFileCount = countIndexableFiles(rootDirectory, allowedExtensions);
+        const existingMetadata = getScanMetadata(activeProfileName);
+        const lastIndexedFileCount = Number.isInteger(existingMetadata?.last_indexed_file_count)
+            ? existingMetadata.last_indexed_file_count
+            : null;
+        const scanDecision = decideScanMode({
+            allowFastSkip,
+            lastIndexedFileCount,
+            currentIndexedFileCount
+        });
+
+        setScanStatusRunning(activeProfileName, 0);
+        const fastCheckLine = `[Scan][${activeProfileName}] Fast check (${trigger}) - current files: ${currentIndexedFileCount}, previous files: ${lastIndexedFileCount === null ? 'none' : lastIndexedFileCount}`;
+        appendScanLog(fastCheckLine);
+        console.log(fastCheckLine);
+
+        if (scanDecision.shouldSkipFullScan) {
+            const skipLine = `[Scan][${activeProfileName}] Full scan skipped (${trigger}) - no file-count changes detected`;
+            scanStatus = {
+                ...scanStatus,
+                status: 'complete',
+                processedArtists: 0,
+                totalArtists: 0,
+                percentage: 100,
+                currentArtist: '',
+                finishedAt: new Date().toISOString(),
+                error: null
+            };
+            appendScanLog(skipLine);
+            console.log(skipLine);
+
+            if (updateBootstrapStatus) {
+                bootstrapStatus = {
+                    status: 'ready',
+                    profile: activeProfileName,
+                    startedAt: bootstrapStatus.startedAt,
+                    finishedAt: new Date().toISOString(),
+                    error: null,
+                    message: `Profile "${activeProfileName}" is ready (no library changes detected).`
+                };
+            }
+
+            return {
+                skipped: true,
+                trigger,
+                reason: scanDecision.reason,
+                indexedFileCount: currentIndexedFileCount
+            };
+        }
+
+        clearDatabase();
         const totalArtists = countArtists(rootDirectory);
         setScanStatusRunning(activeProfileName, totalArtists);
 
@@ -349,6 +481,7 @@ async function runScanJob({ updateBootstrapStatus = false } = {}) {
         };
         appendScanLog(completionLine);
         console.log(completionLine);
+        upsertScanMetadata(activeProfileName, currentIndexedFileCount);
 
         if (updateBootstrapStatus) {
             bootstrapStatus = {
@@ -360,6 +493,13 @@ async function runScanJob({ updateBootstrapStatus = false } = {}) {
                 message: `Profile "${activeProfileName}" is ready.`
             };
         }
+
+        return {
+            skipped: false,
+            trigger,
+            reason: scanDecision.reason,
+            indexedFileCount: currentIndexedFileCount
+        };
     } catch (err) {
         scanStatus = {
             ...scanStatus,
@@ -391,7 +531,11 @@ async function startBootstrapSync() {
     }
 
     try {
-        await runScanJob({ updateBootstrapStatus: true });
+        await runScanJob({
+            updateBootstrapStatus: true,
+            allowFastSkip: true,
+            trigger: 'startup'
+        });
     } catch (err) {
         console.error('Startup sync failed:', err.message);
     }
@@ -434,14 +578,19 @@ app.post('/api/profiles/switch', async (req, res) => {
         // Reinitialize database for new profile
         initDatabase();
 
-        // Always rebuild index for switched profile so data is fresh.
-        await runScanJob();
+        const scanResult = await runScanJob({
+            allowFastSkip: true,
+            trigger: 'profile-switch'
+        });
         
         console.log(`Switched to profile: ${profileName}`);
         res.json({ 
             success: true, 
-            message: `Switched to profile: ${profileName} and scan completed`,
-            activeProfile: profileName
+            message: scanResult?.skipped
+                ? `Switched to profile: ${profileName}. No library changes detected.`
+                : `Switched to profile: ${profileName} and scan completed`,
+            activeProfile: profileName,
+            scan: scanResult
         });
     } catch (err) {
         console.error(err);
@@ -474,9 +623,12 @@ app.get('/api/app-config', (req, res) => {
 app.post('/api/scan', async (req, res) => {
     console.log("Starting Scan...");
     try {
-        await runScanJob();
+        const scanResult = await runScanJob({
+            allowFastSkip: false,
+            trigger: 'manual'
+        });
         
-        res.json({ success: true, message: "Scan complete" });
+        res.json({ success: true, message: "Scan complete", scan: scanResult });
     } catch (err) {
         console.error(err);
         const statusCode = err.statusCode || 500;
@@ -694,41 +846,25 @@ app.get('/api/search', (req, res) => {
             rawTextQuery: req.query.text
         });
 
-        // Temporary debug log for validating parser behavior across query formats.
-        console.log('[Search][Debug] Parsed query:', {
-            rawQ: normalizeQueryStringValue(req.query.q),
-            and: queryPlan.parsedTagQuery.and,
-            or: queryPlan.parsedTagQuery.or,
-            not: queryPlan.parsedTagQuery.not,
-            text: queryPlan.normalizedText
-        });
-
-        // --- SORTING & PAGINATION LOGIC ---
-        // Note: We sort in JavaScript with natural sort instead of SQL to handle numeric filenames correctly
         const { page, limit, offset } = parseSearchPagination(req.query.page, req.query.limit);
 
-        // 1. Get ALL results (no ORDER BY, LIMIT, or OFFSET yet)
-        const rows = db.prepare(queryPlan.sql).all(...queryPlan.params);
+        const countSql = `SELECT COUNT(*) as total FROM (${queryPlan.sql}) as filtered_results`;
+        const totalRow = db.prepare(countSql).get(...queryPlan.params);
+        const total = totalRow?.total || 0;
 
-        // 2. Parse pages JSON and tags CSV
-        const parsedItems = rows.map(r => ({
+        const paginatedSql = `
+            SELECT *
+            FROM (${queryPlan.sql}) as filtered_results
+            ORDER BY artist COLLATE NOCASE, name COLLATE NOCASE
+            LIMIT ? OFFSET ?
+        `;
+        const rows = db.prepare(paginatedSql).all(...queryPlan.params, limit, offset);
+
+        const items = rows.map(r => ({
             ...r,
             pages: r.pages ? JSON.parse(r.pages) : null,
             tags: r.tags ? r.tags.split(',') : []
         }));
-
-        // 3. Sort with natural (numeric) sorting
-        parsedItems.sort((a, b) => {
-            // First sort by artist
-            const artistCompare = a.artist.localeCompare(b.artist, undefined, { numeric: true, sensitivity: 'base' });
-            if (artistCompare !== 0) return artistCompare;
-            // Then by name
-            return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        });
-
-        // 4. Apply pagination manually
-        const total = parsedItems.length;
-        const items = parsedItems.slice(offset, offset + limit);
 
         res.json({
             items,

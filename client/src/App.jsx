@@ -195,6 +195,10 @@ export default function App() {
   const storyPageIndex = searchParams.get('p') ? parseInt(searchParams.get('p')) : 0;
 
   const isFullscreen = viewerIndex !== null;
+  const urlTagQuery = searchParams.get('q') || '';
+  const urlTextQuery = searchParams.get('text') || '';
+  const rawUrlPage = Number.parseInt(searchParams.get('page') || '1', 10);
+  const urlPage = Number.isFinite(rawUrlPage) && rawUrlPage > 0 ? rawUrlPage : 1;
 
   const fetchProfiles = async () => {
     try {
@@ -233,10 +237,16 @@ export default function App() {
     setIsRescanning(true);
 
     try {
-      setToast({ message: `Switching to ${profileName} and scanning...`, loading: true });
-      await axios.post(`${API_URL}/profiles/switch`, { profileName });
+      setToast({ message: `Switching to ${profileName} and syncing...`, loading: true });
+      const response = await axios.post(`${API_URL}/profiles/switch`, { profileName });
       setActiveProfile(profileName);
-      setToast({ message: `Switched to ${profileName}. Scan complete.`, loading: false });
+      const skipped = Boolean(response.data?.scan?.skipped);
+      setToast({
+        message: skipped
+          ? `Switched to ${profileName}. No library changes detected.`
+          : `Switched to ${profileName}. Scan complete.`,
+        loading: false
+      });
       
       // Refresh results for new profile
       const page = parseInt(searchParams.get('page')) || 1;
@@ -267,17 +277,19 @@ export default function App() {
     }
   }, [appConfig.itemsPerPage]);
 
-  // Sync Query with URL
+  // Keep input boxes in sync with URL-driven search state.
   useEffect(() => {
     if (isBootstrapping) return;
 
-    const q = searchParams.get('q');
-    const text = searchParams.get('text');
-    setQuery(q || '');
-    setTextSearch(text || '');
-    const page = parseInt(searchParams.get('page')) || 1;
-    fetchResults(q || '', text || '', page);
-  }, [searchParams, isBootstrapping, fetchResults]);
+    setQuery(urlTagQuery);
+    setTextSearch(urlTextQuery);
+  }, [isBootstrapping, urlTagQuery, urlTextQuery]);
+
+  // Fetch only when search-relevant URL params change (q/text/page), not viewer params (i/p).
+  useEffect(() => {
+    if (isBootstrapping) return;
+    fetchResults(urlTagQuery, urlTextQuery, urlPage);
+  }, [isBootstrapping, fetchResults, urlTagQuery, urlTextQuery, urlPage]);
 
   useEffect(() => {
     let isCancelled = false;
