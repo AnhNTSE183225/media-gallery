@@ -855,7 +855,6 @@ app.get('/api/search', (req, res) => {
         const paginatedSql = `
             SELECT *
             FROM (${queryPlan.sql}) as filtered_results
-            ORDER BY artist COLLATE NOCASE, name COLLATE NOCASE
             LIMIT ? OFFSET ?
         `;
         const rows = db.prepare(paginatedSql).all(...queryPlan.params, limit, offset);
@@ -865,6 +864,13 @@ app.get('/api/search', (req, res) => {
             pages: r.pages ? JSON.parse(r.pages) : null,
             tags: r.tags ? r.tags.split(',') : []
         }));
+
+        // Sort with numeric ordering for natural file/folder names (1, 2, 10, 11 not 1, 10, 11, 2)
+        items.sort((a, b) => {
+            const artistCompare = a.artist.localeCompare(b.artist, undefined, { numeric: true, sensitivity: 'base' });
+            if (artistCompare !== 0) return artistCompare;
+            return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        });
 
         res.json({
             items,
