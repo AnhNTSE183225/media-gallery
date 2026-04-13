@@ -12,12 +12,54 @@ const APP_CONFIG_PATH = path.resolve(__dirname, '..', 'app-config.yaml');
 const DEFAULT_APP_CONFIG = {
     itemsPerPage: 12,
     videoSkipSeconds: 3,
+    logging: {
+        level: 'info'
+    },
     keybinds: {
         previous: ['Digit1'],
         next: ['Digit2'],
         close: ['Escape']
     }
 };
+
+const LOG_LEVEL_PRIORITY = {
+    debug: 10,
+    info: 20,
+    warn: 30,
+    error: 40
+};
+
+function resolveLogLevel(levelCandidate) {
+    const normalized = typeof levelCandidate === 'string' ? levelCandidate.trim().toLowerCase() : '';
+    return Object.prototype.hasOwnProperty.call(LOG_LEVEL_PRIORITY, normalized)
+        ? normalized
+        : DEFAULT_APP_CONFIG.logging.level;
+}
+
+function shouldLog(level) {
+    const configuredLevel = resolveLogLevel(appConfig?.logging?.level);
+    return LOG_LEVEL_PRIORITY[level] >= LOG_LEVEL_PRIORITY[configuredLevel];
+}
+
+function writeLog(level, event, details = {}) {
+    if (!shouldLog(level)) return;
+
+    const entry = {
+        timestamp: new Date().toISOString(),
+        level,
+        event,
+        ...details
+    };
+
+    const line = JSON.stringify(entry);
+    if (level === 'error') {
+        console.error(line);
+    } else if (level === 'warn') {
+        console.warn(line);
+    } else {
+        console.log(line);
+    }
+}
 
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
@@ -34,6 +76,7 @@ function normalizeKeyArray(value, fallback) {
 function normalizeAppConfig(rawConfig) {
     const rawItemsPerPage = Number(rawConfig?.pagination?.itemsPerPage);
     const rawVideoSkipSeconds = Number(rawConfig?.viewer?.videoSkipSeconds);
+    const loggingLevel = resolveLogLevel(rawConfig?.logging?.level);
 
     return {
         itemsPerPage: Number.isFinite(rawItemsPerPage)
@@ -42,6 +85,9 @@ function normalizeAppConfig(rawConfig) {
         videoSkipSeconds: Number.isFinite(rawVideoSkipSeconds) && rawVideoSkipSeconds > 0
             ? rawVideoSkipSeconds
             : DEFAULT_APP_CONFIG.videoSkipSeconds,
+        logging: {
+            level: loggingLevel
+        },
         keybinds: {
             previous: normalizeKeyArray(rawConfig?.keybinds?.previous, DEFAULT_APP_CONFIG.keybinds.previous),
             next: normalizeKeyArray(rawConfig?.keybinds?.next, DEFAULT_APP_CONFIG.keybinds.next),
@@ -830,6 +876,13 @@ function buildSearchQueryPlan({ rawTagQuery, rawTextQuery }) {
 
     assertSqlParamAlignment(sql, params);
 
+    writeLog('debug', 'search.query_plan_built', {
+        parsedTagQuery,
+        normalizedText,
+        sql,
+        paramCount: params.length
+    });
+
     return {
         sql,
         params,
@@ -840,6 +893,16 @@ function buildSearchQueryPlan({ rawTagQuery, rawTextQuery }) {
 
 // 3. Search
 app.get('/api/search', (req, res) => {
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    writeLog('info', 'search.request_received', {
+        requestId,
+        q: normalizeQueryStringValue(req.query.q),
+        text: normalizeTextQueryValue(req.query.text),
+        page: req.query.page ?? null,
+        limit: req.query.limit ?? null
+    });
+
     try {
         const queryPlan = buildSearchQueryPlan({
             rawTagQuery: req.query.q,
@@ -858,6 +921,15 @@ app.get('/api/search', (req, res) => {
             LIMIT ? OFFSET ?
         `;
         const rows = db.prepare(paginatedSql).all(...queryPlan.params, limit, offset);
+
+        writeLog('debug', 'search.database_query_complete', {
+            requestId,
+            page,
+            limit,
+            offset,
+            total,
+            rowCount: rows.length
+        });
 
         const items = rows.map(r => ({
             ...r,
@@ -881,9 +953,22 @@ app.get('/api/search', (req, res) => {
                 totalPages: Math.ceil(total / limit)
             }
         });
+
+        writeLog('info', 'search.response_sent', {
+            requestId,
+            total,
+            returned: items.length,
+            page,
+            totalPages: Math.ceil(total / limit)
+        });
     } catch (err) {
-        console.error("Search Error:", err);
         const statusCode = err.statusCode || 500;
+        writeLog('error', 'search.request_failed', {
+            requestId,
+            statusCode,
+            message: err.message,
+            stack: resolveLogLevel(appConfig?.logging?.level) === 'debug' ? err.stack : undefined
+        });
         res.status(statusCode).json({ error: err.message });
     }
 });

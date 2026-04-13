@@ -1,8 +1,11 @@
 pagination:
-  itemsPerPage: 18
+  itemsPerPage: 16
 
 viewer:
   videoSkipSeconds: 3
+
+logging:
+  level: info
 
 keybinds:
   previous:
