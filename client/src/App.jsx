@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
+import React, { useState, useEffect, useRef, useCallback, memo, useMemo } from 'react';
 import axios from 'axios';
 import { useSearchParams } from 'react-router-dom';
 import { Book, ArrowLeft, ArrowRight, X } from 'lucide-react';
@@ -11,7 +11,10 @@ const DEFAULT_APP_CONFIG = {
   keybinds: {
     previous: ['Digit1'],
     next: ['Digit2'],
-    close: ['Escape']
+    close: ['Escape'],
+    fitWidth: ['KeyW'],
+    fitHeight: ['KeyH'],
+    fitDefault: ['KeyC']
   }
 };
 
@@ -51,7 +54,10 @@ const normalizeAppConfig = (rawConfig) => {
     keybinds: {
       previous: normalizeKeyArray(rawConfig?.keybinds?.previous, DEFAULT_APP_CONFIG.keybinds.previous),
       next: normalizeKeyArray(rawConfig?.keybinds?.next, DEFAULT_APP_CONFIG.keybinds.next),
-      close: normalizeKeyArray(rawConfig?.keybinds?.close, DEFAULT_APP_CONFIG.keybinds.close)
+      close: normalizeKeyArray(rawConfig?.keybinds?.close, DEFAULT_APP_CONFIG.keybinds.close),
+      fitWidth: normalizeKeyArray(rawConfig?.keybinds?.fitWidth, DEFAULT_APP_CONFIG.keybinds.fitWidth),
+      fitHeight: normalizeKeyArray(rawConfig?.keybinds?.fitHeight, DEFAULT_APP_CONFIG.keybinds.fitHeight),
+      fitDefault: normalizeKeyArray(rawConfig?.keybinds?.fitDefault, DEFAULT_APP_CONFIG.keybinds.fitDefault)
     }
   };
 };
@@ -126,7 +132,7 @@ const GalleryItem = memo(({ item, idx, onOpen }) => {
     <div
       ref={containerRef}
       onClick={() => onOpen(idx)}
-      className="relative group cursor-pointer border border-gray-700 rounded overflow-hidden bg-gray-800"
+      className="gallery-card relative group cursor-pointer border border-gray-700 rounded overflow-hidden bg-gray-800"
     >
       <div className="aspect-[3/4] overflow-hidden bg-black flex items-center justify-center">
         {isVisible ? (
@@ -146,6 +152,7 @@ const GalleryItem = memo(({ item, idx, onOpen }) => {
             <img
               src={getMediaUrl(thumbnailPath, true)}
               alt={item.name}
+              loading="lazy"
               className="w-full h-full object-cover transition-transform group-hover:scale-105"
             />
           )
@@ -153,15 +160,15 @@ const GalleryItem = memo(({ item, idx, onOpen }) => {
           <div className="w-full h-full bg-gray-800" />
         )}
       </div>
-      <div className="p-2 text-sm">
+      <div className="gallery-card-body p-2 text-sm">
         <p className="font-bold truncate text-blue-300">{item.artist}</p>
         <div className="flex justify-between items-center">
           <p className="truncate opacity-80">{item.name}</p>
           {item.type === 'story' && <Book size={14} className="text-yellow-500" />}
         </div>
-        <div className="flex flex-wrap gap-1 mt-2">
+        <div className="gallery-card-tags flex flex-wrap gap-1 mt-2">
           {item.tags && item.tags.map(tag => (
-            <span key={tag} className="text-[10px] bg-gray-700 px-1.5 py-0.5 rounded text-gray-300">
+            <span key={tag} className="text-[0.625rem] bg-gray-700 px-1.5 py-0.5 rounded text-gray-300">
               {tag}
             </span>
           ))}
@@ -185,10 +192,14 @@ export default function App() {
   const [appConfig, setAppConfig] = useState(DEFAULT_APP_CONFIG);
   const [scanStatus, setScanStatus] = useState(DEFAULT_SCAN_STATUS);
   const videoRef = useRef(null);
+  const hideUiTimerRef = useRef(null);
   
   // Profile Management State
   const [profiles, setProfiles] = useState([]);
   const [activeProfile, setActiveProfile] = useState('');
+  const [viewerFitMode, setViewerFitMode] = useState('contain');
+  const [viewerUiVisible, setViewerUiVisible] = useState(true);
+  const viewerViewportRef = useRef(null);
 
   // Viewer State (derived from URL)
   const viewerIndex = searchParams.get('i') ? parseInt(searchParams.get('i')) : null;
@@ -401,14 +412,14 @@ export default function App() {
 
   // --- NAVIGATION LOGIC ---
 
-  const openViewer = (index) => {
+  const openViewer = useCallback((index) => {
     setSearchParams(prev => {
       const newParams = new URLSearchParams(prev);
       newParams.set('i', index);
       newParams.set('p', '0');
       return newParams;
     });
-  };
+  }, [setSearchParams]);
 
   const closeViewer = useCallback(() => {
     setSearchParams(prev => {
@@ -486,6 +497,77 @@ export default function App() {
     }
   }, [viewerIndex, items, storyPageIndex, searchParams, totalPages, setSearchParams]);
 
+  const markViewerInteraction = useCallback(() => {
+    setViewerUiVisible(true);
+
+    if (hideUiTimerRef.current) {
+      clearTimeout(hideUiTimerRef.current);
+    }
+
+    hideUiTimerRef.current = setTimeout(() => {
+      setViewerUiVisible(false);
+    }, 1800);
+  }, []);
+
+  useEffect(() => {
+    if (!isFullscreen) {
+      setViewerUiVisible(true);
+      if (hideUiTimerRef.current) {
+        clearTimeout(hideUiTimerRef.current);
+      }
+      return;
+    }
+
+    markViewerInteraction();
+
+    const onPointerMove = () => markViewerInteraction();
+    window.addEventListener('mousemove', onPointerMove, { passive: true });
+
+    return () => {
+      window.removeEventListener('mousemove', onPointerMove);
+      if (hideUiTimerRef.current) {
+        clearTimeout(hideUiTimerRef.current);
+      }
+    };
+  }, [isFullscreen, markViewerInteraction]);
+
+  // Preload neighboring assets/pages for smoother next/previous navigation.
+  useEffect(() => {
+    if (viewerIndex === null || !items.length) return;
+
+    const urlsToPreload = [];
+    const current = items[viewerIndex];
+
+    if (current?.type === 'story' && current.pages?.length > 0) {
+      const prevPage = current.pages[storyPageIndex - 1];
+      const nextPage = current.pages[storyPageIndex + 1];
+      if (prevPage) urlsToPreload.push(getMediaUrl(prevPage));
+      if (nextPage) urlsToPreload.push(getMediaUrl(nextPage));
+    }
+
+    const prevItem = items[viewerIndex - 1];
+    const nextItem = items[viewerIndex + 1];
+    if (prevItem) {
+      urlsToPreload.push(getMediaUrl(prevItem.type === 'story' ? prevItem.pages?.[0] : prevItem.path));
+    }
+    if (nextItem) {
+      urlsToPreload.push(getMediaUrl(nextItem.type === 'story' ? nextItem.pages?.[0] : nextItem.path));
+    }
+
+    urlsToPreload.filter(Boolean).forEach((url) => {
+      const link = document.createElement('link');
+      link.rel = 'preload';
+      link.as = 'image';
+      link.href = url;
+      document.head.appendChild(link);
+      setTimeout(() => {
+        if (link.parentNode) {
+          link.parentNode.removeChild(link);
+        }
+      }, 3000);
+    });
+  }, [viewerIndex, storyPageIndex, items]);
+
   // Auto-correct Viewer Index if items change size (e.g. prev page has fewer items)
   useEffect(() => {
     if (items.length > 0 && viewerIndex === -1) {
@@ -547,11 +629,25 @@ export default function App() {
       
       if (appConfig.keybinds.next.includes(e.code)) {
         e.preventDefault();
+        markViewerInteraction();
         navigateViewer(1, skipStory);
       }
       if (appConfig.keybinds.previous.includes(e.code)) {
         e.preventDefault();
+        markViewerInteraction();
         navigateViewer(-1, skipStory);
+      }
+      if (appConfig.keybinds.fitWidth.includes(e.code)) {
+        e.preventDefault();
+        setViewerFitMode('fit-width');
+      }
+      if (appConfig.keybinds.fitHeight.includes(e.code)) {
+        e.preventDefault();
+        setViewerFitMode('fit-height');
+      }
+      if (appConfig.keybinds.fitDefault.includes(e.code)) {
+        e.preventDefault();
+        setViewerFitMode('contain');
       }
       if (appConfig.keybinds.close.includes(e.code) || appConfig.keybinds.close.includes(e.key)) {
         closeViewer();
@@ -560,11 +656,68 @@ export default function App() {
     // Use capture: true to intercept events before browser defaults
     window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [isFullscreen, viewerIndex, storyPageIndex, items, appConfig, navigateViewer, closeViewer]);
+  }, [isFullscreen, viewerIndex, storyPageIndex, items, appConfig, navigateViewer, closeViewer, markViewerInteraction]);
 
   // --- RENDERERS ---
 
   const currentItem = viewerIndex !== null ? items[viewerIndex] : null;
+  const viewerMediaClass = useMemo(() => {
+    if (viewerFitMode === 'fit-width') return 'w-full h-auto max-h-none object-contain';
+    if (viewerFitMode === 'fit-height') return 'w-auto h-full max-w-none object-contain';
+    return 'w-full h-full object-contain';
+  }, [viewerFitMode]);
+  const viewerViewportClass = useMemo(() => {
+    if (viewerFitMode === 'fit-width') {
+      return 'absolute inset-0 overflow-y-auto overflow-x-hidden p-4 flex items-start justify-center';
+    }
+
+    if (viewerFitMode === 'fit-height') {
+      return 'absolute inset-0 overflow-x-auto overflow-y-hidden p-4 flex items-center justify-start';
+    }
+
+    return 'absolute inset-0 flex items-center justify-center p-4 overflow-hidden';
+  }, [viewerFitMode]);
+
+  const handleViewerWheel = useCallback((event) => {
+    if (!isFullscreen || !currentItem) return;
+    if (viewerFitMode === 'contain') return;
+
+    const viewport = viewerViewportRef.current;
+    if (!viewport) return;
+
+    const isWidthFit = viewerFitMode === 'fit-width';
+    const scrollDelta = isWidthFit
+      ? event.deltaY + event.deltaX
+      : event.deltaX + event.deltaY;
+
+    if (scrollDelta === 0) return;
+
+    const maxScroll = isWidthFit
+      ? viewport.scrollHeight - viewport.clientHeight
+      : viewport.scrollWidth - viewport.clientWidth;
+
+    if (maxScroll <= 0) return;
+
+    const currentScroll = isWidthFit ? viewport.scrollTop : viewport.scrollLeft;
+    const nextScroll = Math.max(0, Math.min(maxScroll, currentScroll + scrollDelta));
+
+    if (nextScroll !== currentScroll) {
+      event.preventDefault();
+      event.stopPropagation();
+      markViewerInteraction();
+
+      if (isWidthFit) {
+        viewport.scrollTop = nextScroll;
+      } else {
+        viewport.scrollLeft = nextScroll;
+      }
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    markViewerInteraction();
+  }, [currentItem, isFullscreen, markViewerInteraction, navigateViewer, viewerFitMode]);
   const currentPage = parseInt(searchParams.get('page')) || 1;
 
   if (isBootstrapping || isRescanning) {
@@ -627,24 +780,24 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white p-4 lg:p-5 font-sans">
+    <div className="media-gallery-app flex min-h-screen flex-col overflow-hidden bg-gray-900 text-white p-4 lg:p-5 font-sans">
 
       {/* HEADER */}
-      <div className="mb-4">
-        <div className="flex gap-3 mb-2">
+      <div className="gallery-toolbar mb-3">
+        <div className="flex flex-wrap items-center gap-3 mb-2 lg:flex-nowrap">
           {/* Profile Selector */}
           {profiles.length > 0 && (
             <select 
               value={activeProfile} 
               onChange={(e) => switchProfile(e.target.value)}
-              className="bg-gray-800 px-4 py-2 rounded border border-gray-700 hover:border-blue-500 focus:outline-none focus:border-blue-500 cursor-pointer"
+              className="bg-gray-800 px-4 py-2 rounded border border-gray-700 hover:border-blue-500 focus:outline-none focus:border-blue-500 cursor-pointer text-sm"
             >
               {profiles.map(profile => (
                 <option key={profile} value={profile}>{profile}</option>
               ))}
             </select>
           )}
-          <button onClick={triggerScan} className="bg-blue-600 px-4 py-2 rounded hover:bg-blue-500">
+          <button onClick={triggerScan} className="bg-blue-600 px-4 py-2 rounded hover:bg-blue-500 text-sm whitespace-nowrap">
             Rescan Library
           </button>
           <div className="flex-1 flex gap-2 min-w-0">
@@ -656,7 +809,7 @@ export default function App() {
                 value={textSearch}
                 onChange={(e) => setTextSearch(e.target.value)}
                 placeholder="Search Artist / Story Name..."
-                className="w-1/3 min-w-[180px] p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
+                className="search-input w-1/3 min-w-[11rem] p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 text-sm"
               />
               {/* Tag Search */}
               <input
@@ -665,13 +818,13 @@ export default function App() {
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search tags (e.g., tag1,tag2 | tag3|tag4 | -tag5)..."
-                className="flex-1 min-w-0 p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
+                className="search-input flex-1 min-w-0 p-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 text-sm"
               />
               <button type="submit" className="hidden">Search</button>
             </form>
 
             {totalPages > 1 && (
-              <div className="hidden lg:flex items-center gap-2 px-2 py-1 bg-gray-800 rounded border border-gray-700 whitespace-nowrap">
+              <div className="hidden lg:flex items-center gap-2 px-2 py-1 bg-gray-800 rounded border border-gray-700 whitespace-nowrap text-sm">
                 <button
                   onClick={() => handlePageChange(currentPage - 1)}
                   disabled={currentPage === 1}
@@ -695,7 +848,7 @@ export default function App() {
         </div>
         
         {/* Search Help Text */}
-        <div className="text-[11px] text-gray-500 ml-auto pl-24">
+        <div className="gallery-search-help text-[0.6875rem] text-gray-500 ml-auto pl-24">
           <span className="font-semibold text-gray-400">Tag operators:</span> 
           <span className="ml-2"><code className="bg-gray-800 px-1 py-0.5 rounded">tag1,tag2</code> = AND (both required)</span>
           <span className="ml-3"><code className="bg-gray-800 px-1 py-0.5 rounded">tag1|tag2</code> = OR (at least one)</span>
@@ -704,7 +857,7 @@ export default function App() {
       </div>
 
       {/* GALLERY GRID */}
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 xl:grid-cols-8 2xl:grid-cols-9 gap-3">
+      <div className="gallery-grid grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 xl:grid-cols-8 2xl:grid-cols-9 gap-3 flex-1 min-h-0 overflow-hidden">
         {items.map((item, idx) => (
           <GalleryItem key={item.id} item={item} idx={idx} onOpen={openViewer} />
         ))}
@@ -712,21 +865,21 @@ export default function App() {
 
       {/* PAGINATION CONTROLS */}
       {totalPages > 1 && (
-        <div className="flex justify-center items-center gap-4 mt-8 mb-4">
+        <div className="pagination-bar flex justify-center items-center gap-4 mt-4 mb-2">
           <button
             onClick={() => handlePageChange(currentPage - 1)}
             disabled={currentPage === 1}
-            className="px-4 py-2 bg-gray-800 rounded disabled:opacity-50 hover:bg-gray-700"
+            className="px-4 py-2 bg-gray-800 rounded disabled:opacity-50 hover:bg-gray-700 text-sm"
           >
             Previous
           </button>
-          <span className="text-gray-400">
+          <span className="text-gray-400 text-sm">
             Page {currentPage} of {totalPages}
           </span>
           <button
             onClick={() => handlePageChange(currentPage + 1)}
             disabled={currentPage === totalPages}
-            className="px-4 py-2 bg-gray-800 rounded disabled:opacity-50 hover:bg-gray-700"
+            className="px-4 py-2 bg-gray-800 rounded disabled:opacity-50 hover:bg-gray-700 text-sm"
           >
             Next
           </button>
@@ -738,7 +891,7 @@ export default function App() {
         <div className="fixed inset-0 bg-black z-[100] flex flex-col h-screen w-screen overflow-hidden">
 
           {/* Top Bar - Now absolute and fades out or stays on top */}
-          <div className="absolute top-0 left-0 right-0 p-4 flex justify-between z-20 pointer-events-none">
+          <div className={`absolute top-0 left-0 right-0 p-4 flex justify-between z-20 pointer-events-none transition-opacity duration-200 ${viewerUiVisible ? 'opacity-100' : 'opacity-0'}`}>
             <div className="pointer-events-auto">
               <h2 className="text-xl font-bold text-white drop-shadow-md">{currentItem.artist} / {currentItem.name}</h2>
               {currentItem.type === 'story' && (
@@ -746,6 +899,26 @@ export default function App() {
                   Page {storyPageIndex + 1} of {currentItem.pages.length}
                 </span>
               )}
+              <div className="mt-2 flex gap-2 pointer-events-auto">
+                <button
+                  onClick={() => setViewerFitMode('contain')}
+                  className={`px-2 py-1 text-xs rounded ${viewerFitMode === 'contain' ? 'bg-blue-600' : 'bg-black/40 hover:bg-white/20'}`}
+                >
+                  Fit
+                </button>
+                <button
+                  onClick={() => setViewerFitMode('fit-width')}
+                  className={`px-2 py-1 text-xs rounded ${viewerFitMode === 'fit-width' ? 'bg-blue-600' : 'bg-black/40 hover:bg-white/20'}`}
+                >
+                  Width
+                </button>
+                <button
+                  onClick={() => setViewerFitMode('fit-height')}
+                  className={`px-2 py-1 text-xs rounded ${viewerFitMode === 'fit-height' ? 'bg-blue-600' : 'bg-black/40 hover:bg-white/20'}`}
+                >
+                  Height
+                </button>
+              </div>
             </div>
             <button onClick={closeViewer} className="pointer-events-auto p-2 bg-black/40 rounded-full hover:bg-white/20 transition-colors">
               <X size={32} />
@@ -753,7 +926,11 @@ export default function App() {
           </div>
 
           {/* Main Content */}
-          <div className="absolute inset-0 flex items-center justify-center p-4">
+          <div
+            ref={viewerViewportRef}
+            onWheel={handleViewerWheel}
+            className={viewerViewportClass}
+          >
             {(() => {
               const pathToShow = currentItem.type === 'story'
                 ? currentItem.pages[storyPageIndex]
@@ -768,14 +945,14 @@ export default function App() {
                     src={getMediaUrl(pathToShow)}
                     controls
                     autoPlay
-                    className="w-full h-full object-contain"
+                    className={`${viewerMediaClass} flex-none`}
                   />
                 );
               }
               return (
                 <img
                   src={getMediaUrl(pathToShow)}
-                  className="w-full h-full object-contain drop-shadow-2xl"
+                  className={`${viewerMediaClass} drop-shadow-2xl flex-none`}
                 />
               );
             })()}
@@ -783,16 +960,20 @@ export default function App() {
 
           {/* Navigation Overlay Hints */}
           <button
-            className="absolute left-4 top-1/2 -translate-y-1/2 p-4 bg-white/10 hover:bg-white/20 rounded-full z-10"
-            onClick={(e) => { e.stopPropagation(); navigateViewer(-1, e.shiftKey); }}
+            className={`absolute left-0 top-0 bottom-0 w-12 md:w-16 bg-gradient-to-r from-black/30 to-transparent hover:from-black/50 z-10 transition-opacity duration-200 ${viewerUiVisible ? 'opacity-100' : 'opacity-0'}`}
+            onClick={(e) => { e.stopPropagation(); markViewerInteraction(); navigateViewer(-1, e.shiftKey); }}
           >
-            <ArrowLeft size={32} />
+            <span className="absolute left-2 top-1/2 -translate-y-1/2">
+              <ArrowLeft size={28} />
+            </span>
           </button>
           <button
-            className="absolute right-4 top-1/2 -translate-y-1/2 p-4 bg-white/10 hover:bg-white/20 rounded-full z-10"
-            onClick={(e) => { e.stopPropagation(); navigateViewer(1, e.shiftKey); }}
+            className={`absolute right-0 top-0 bottom-0 w-12 md:w-16 bg-gradient-to-l from-black/30 to-transparent hover:from-black/50 z-10 transition-opacity duration-200 ${viewerUiVisible ? 'opacity-100' : 'opacity-0'}`}
+            onClick={(e) => { e.stopPropagation(); markViewerInteraction(); navigateViewer(1, e.shiftKey); }}
           >
-            <ArrowRight size={32} />
+            <span className="absolute right-2 top-1/2 -translate-y-1/2">
+              <ArrowRight size={28} />
+            </span>
           </button>
         </div>
       )}

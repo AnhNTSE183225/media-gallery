@@ -1,5 +1,5 @@
 pagination:
-  itemsPerPage: 16
+  itemsPerPage: 36
 
 viewer:
   videoSkipSeconds: 3
@@ -14,3 +14,9 @@ keybinds:
     - Digit2
   close:
     - Escape
+  fitWidth:
+    - KeyW
+  fitHeight:
+    - KeyH
+  fitDefault:
+    - KeyC

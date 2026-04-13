@@ -4,6 +4,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
+const chokidar = require('chokidar');
 const { load: parseYaml } = require('js-yaml');
 
 const app = express();
@@ -18,7 +19,10 @@ const DEFAULT_APP_CONFIG = {
     keybinds: {
         previous: ['Digit1'],
         next: ['Digit2'],
-        close: ['Escape']
+        close: ['Escape'],
+        fitWidth: ['KeyW'],
+        fitHeight: ['KeyH'],
+        fitDefault: ['KeyC']
     }
 };
 
@@ -91,7 +95,10 @@ function normalizeAppConfig(rawConfig) {
         keybinds: {
             previous: normalizeKeyArray(rawConfig?.keybinds?.previous, DEFAULT_APP_CONFIG.keybinds.previous),
             next: normalizeKeyArray(rawConfig?.keybinds?.next, DEFAULT_APP_CONFIG.keybinds.next),
-            close: normalizeKeyArray(rawConfig?.keybinds?.close, DEFAULT_APP_CONFIG.keybinds.close)
+            close: normalizeKeyArray(rawConfig?.keybinds?.close, DEFAULT_APP_CONFIG.keybinds.close),
+            fitWidth: normalizeKeyArray(rawConfig?.keybinds?.fitWidth, DEFAULT_APP_CONFIG.keybinds.fitWidth),
+            fitHeight: normalizeKeyArray(rawConfig?.keybinds?.fitHeight, DEFAULT_APP_CONFIG.keybinds.fitHeight),
+            fitDefault: normalizeKeyArray(rawConfig?.keybinds?.fitDefault, DEFAULT_APP_CONFIG.keybinds.fitDefault)
         }
     };
 }
@@ -125,7 +132,13 @@ function getDbFileName(profileName) {
     return `library_${safeName}.db`;
 }
 
-function decideScanMode({ allowFastSkip, lastIndexedFileCount, currentIndexedFileCount }) {
+function decideScanMode({
+    allowFastSkip,
+    lastIndexedFileCount,
+    currentIndexedFileCount,
+    lastIndexedFingerprint,
+    currentIndexedFingerprint
+}) {
     if (!allowFastSkip) {
         return { shouldSkipFullScan: false, reason: 'fast-skip-disabled' };
     }
@@ -138,12 +151,24 @@ function decideScanMode({ allowFastSkip, lastIndexedFileCount, currentIndexedFil
         return { shouldSkipFullScan: false, reason: 'file-count-changed' };
     }
 
+    if (lastIndexedFingerprint !== null && currentIndexedFingerprint !== null) {
+        if (lastIndexedFingerprint !== currentIndexedFingerprint) {
+            return { shouldSkipFullScan: false, reason: 'fingerprint-changed' };
+        }
+    }
+
     return { shouldSkipFullScan: true, reason: 'file-count-unchanged' };
 }
 
 // Prepared statements (will be initialized with database)
 let insertAsset;
 let insertTag;
+const thumbnailCache = new Map();
+const MAX_THUMBNAIL_CACHE_SIZE = 300;
+const THUMBNAIL_CACHE_TTL_MS = 15 * 60 * 1000;
+let profileWatcher = null;
+let incrementalScanTimer = null;
+const pendingArtistSync = new Set();
 
 // Initialize database for current profile
 function initDatabase() {
@@ -176,12 +201,20 @@ function initDatabase() {
             CREATE TABLE IF NOT EXISTS scan_metadata (
                 profile TEXT PRIMARY KEY,
                 last_indexed_file_count INTEGER NOT NULL,
+                last_indexed_fingerprint TEXT,
                 last_successful_scan_at DATETIME NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_assets_artist_name ON assets(artist, name);
             CREATE INDEX IF NOT EXISTS idx_asset_tags_tag ON asset_tags(tag);
             CREATE INDEX IF NOT EXISTS idx_asset_tags_asset_tag ON asset_tags(asset_id, tag);
     `);
+
+    // Backward-compatible migration for existing metadata table.
+    try {
+        db.exec('ALTER TABLE scan_metadata ADD COLUMN last_indexed_fingerprint TEXT');
+    } catch (err) {
+        // Ignore duplicate-column errors on already-migrated databases.
+    }
     
     // Create/recreate prepared statements for the new database connection
     insertAsset = db.prepare(`INSERT OR REPLACE INTO assets (path, type, artist, name, pages) VALUES (?, ?, ?, ?, ?)`);
@@ -190,18 +223,19 @@ function initDatabase() {
 
 function getScanMetadata(profileName) {
     return db
-        .prepare('SELECT profile, last_indexed_file_count, last_successful_scan_at FROM scan_metadata WHERE profile = ?')
+        .prepare('SELECT profile, last_indexed_file_count, last_indexed_fingerprint, last_successful_scan_at FROM scan_metadata WHERE profile = ?')
         .get(profileName) || null;
 }
 
-function upsertScanMetadata(profileName, indexedFileCount) {
+function upsertScanMetadata(profileName, indexedFileCount, indexedFingerprint) {
     db.prepare(`
-        INSERT INTO scan_metadata (profile, last_indexed_file_count, last_successful_scan_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO scan_metadata (profile, last_indexed_file_count, last_indexed_fingerprint, last_successful_scan_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(profile) DO UPDATE SET
             last_indexed_file_count = excluded.last_indexed_file_count,
+            last_indexed_fingerprint = excluded.last_indexed_fingerprint,
             last_successful_scan_at = CURRENT_TIMESTAMP
-    `).run(profileName, indexedFileCount);
+    `).run(profileName, indexedFileCount, indexedFingerprint);
 }
 
 // Initialize on startup
@@ -358,10 +392,15 @@ async function scanDirectory(dirPath, artistName = null, currentTags = [], scanC
     if (!fs.existsSync(dirPath)) return;
 
     const items = fs.readdirSync(dirPath);
+    let processedSinceYield = 0;
 
     for (const item of items) {
-        // Keep scans responsive so API requests (e.g. status polling) are not starved.
-        await new Promise(resolve => setImmediate(resolve));
+        // Keep scans responsive without incurring a per-file await cost.
+        processedSinceYield += 1;
+        if (processedSinceYield >= 200) {
+            processedSinceYield = 0;
+            await new Promise(resolve => setImmediate(resolve));
+        }
 
         const fullPath = path.join(dirPath, item);
         let stat;
@@ -421,6 +460,199 @@ function clearDatabase() {
     db.prepare('DELETE FROM assets').run();
 }
 
+function clearArtistFromDatabase(artistName) {
+    if (!artistName) return;
+    db.prepare('DELETE FROM assets WHERE artist = ?').run(artistName);
+}
+
+function getRootMtimeFingerprint(rootDirectory) {
+    try {
+        const stat = fs.statSync(rootDirectory);
+        return String(Math.trunc(stat.mtimeMs));
+    } catch {
+        return null;
+    }
+}
+
+function countIndexableFilesSummary(dirPath, allowedExtensions) {
+    if (!fs.existsSync(dirPath)) {
+        return { count: 0, fingerprint: getRootMtimeFingerprint(dirPath) };
+    }
+
+    const extensions = new Set((allowedExtensions || []).map(ext => ext.toLowerCase()));
+    const stack = [dirPath];
+    let count = 0;
+    let latestMtime = 0;
+
+    while (stack.length > 0) {
+        const currentDir = stack.pop();
+        let items;
+
+        try {
+            items = fs.readdirSync(currentDir);
+        } catch {
+            continue;
+        }
+
+        for (const item of items) {
+            const fullPath = path.join(currentDir, item);
+            let stat;
+
+            try {
+                stat = fs.statSync(fullPath);
+            } catch {
+                continue;
+            }
+
+            if (stat.mtimeMs > latestMtime) {
+                latestMtime = stat.mtimeMs;
+            }
+
+            if (stat.isDirectory()) {
+                stack.push(fullPath);
+                continue;
+            }
+
+            if (extensions.has(path.extname(item).toLowerCase())) {
+                count += 1;
+            }
+        }
+    }
+
+    const fingerprint = `${count}-${Math.trunc(latestMtime)}`;
+    return { count, fingerprint };
+}
+
+function getArtistFromPath(filePathCandidate, rootDirectory) {
+    if (!filePathCandidate || !rootDirectory) return null;
+
+    const relativePath = path.relative(rootDirectory, filePathCandidate);
+    if (!relativePath || relativePath.startsWith('..')) {
+        return null;
+    }
+
+    const parts = relativePath.split(path.sep).filter(Boolean);
+    if (parts.length === 0) {
+        return null;
+    }
+
+    return parts[0];
+}
+
+async function runIncrementalArtistSync(triggerSource = 'watcher') {
+    if (isScanning) {
+        scheduleIncrementalSync(triggerSource);
+        return;
+    }
+
+    const artistsToSync = [...pendingArtistSync];
+    pendingArtistSync.clear();
+
+    if (artistsToSync.length === 0) {
+        return;
+    }
+
+    isScanning = true;
+    setScanStatusRunning(activeProfileName, artistsToSync.length);
+
+    const rootDirectory = getActiveProfile().rootDirectory;
+    const scanContext = {
+        totalArtists: artistsToSync.length,
+        processedArtists: 0,
+        lastLoggedPercent: -1
+    };
+
+    try {
+        for (const artistName of artistsToSync) {
+            const artistPath = path.join(rootDirectory, artistName);
+            clearArtistFromDatabase(artistName);
+
+            try {
+                if (fs.existsSync(artistPath) && fs.statSync(artistPath).isDirectory()) {
+                    await scanDirectory(artistPath, artistName, [], scanContext);
+                }
+            } catch {
+                // Ignore transient races from rapid file moves/deletes while syncing.
+            }
+
+            logScanProgress(scanContext, artistName);
+        }
+
+        const summary = countIndexableFilesSummary(rootDirectory, getActiveProfile().allowedExtensions);
+        upsertScanMetadata(activeProfileName, summary.count, summary.fingerprint);
+
+        scanStatus = {
+            ...scanStatus,
+            status: 'complete',
+            percentage: 100,
+            finishedAt: new Date().toISOString(),
+            error: null
+        };
+        appendScanLog(`[Scan][${activeProfileName}] Incremental sync complete (${triggerSource})`);
+    } catch (err) {
+        scanStatus = {
+            ...scanStatus,
+            status: 'error',
+            finishedAt: new Date().toISOString(),
+            error: err.message
+        };
+        appendScanLog(`[Scan][${activeProfileName}] Incremental sync failed: ${err.message}`);
+    } finally {
+        isScanning = false;
+    }
+}
+
+function scheduleIncrementalSync(triggerSource = 'watcher') {
+    if (incrementalScanTimer) {
+        clearTimeout(incrementalScanTimer);
+    }
+
+    incrementalScanTimer = setTimeout(() => {
+        incrementalScanTimer = null;
+        void runIncrementalArtistSync(triggerSource);
+    }, 600);
+}
+
+function startProfileWatcher() {
+    if (profileWatcher) {
+        profileWatcher.close();
+        profileWatcher = null;
+    }
+
+    const activeProfile = getActiveProfile();
+    const rootDirectory = activeProfile?.rootDirectory;
+
+    if (!rootDirectory || !fs.existsSync(rootDirectory)) {
+        return;
+    }
+
+    profileWatcher = chokidar.watch(rootDirectory, {
+        ignoreInitial: true,
+        awaitWriteFinish: {
+            stabilityThreshold: 200,
+            pollInterval: 50
+        }
+    });
+
+    const onFsChange = (changedPath) => {
+        const artist = getArtistFromPath(changedPath, rootDirectory);
+        if (!artist) return;
+
+        pendingArtistSync.add(artist);
+        scheduleIncrementalSync('watcher');
+    };
+
+    profileWatcher
+        .on('add', onFsChange)
+        .on('change', onFsChange)
+        .on('unlink', onFsChange)
+        .on('addDir', onFsChange)
+        .on('unlinkDir', onFsChange)
+        .on('error', (err) => {
+            appendScanLog(`[Scan][${activeProfileName}] Watcher error: ${err.message}`);
+        });
+}
+
 async function runScanJob({ updateBootstrapStatus = false, allowFastSkip = false, trigger = 'manual' } = {}) {
     if (isScanning) {
         const error = new Error('A scan is already running');
@@ -443,15 +675,22 @@ async function runScanJob({ updateBootstrapStatus = false, allowFastSkip = false
     try {
         const rootDirectory = getActiveProfile().rootDirectory;
         const allowedExtensions = getActiveProfile().allowedExtensions;
-        const currentIndexedFileCount = countIndexableFiles(rootDirectory, allowedExtensions);
+        const summary = countIndexableFilesSummary(rootDirectory, allowedExtensions);
+        const currentIndexedFileCount = summary.count;
+        const currentIndexedFingerprint = summary.fingerprint;
         const existingMetadata = getScanMetadata(activeProfileName);
         const lastIndexedFileCount = Number.isInteger(existingMetadata?.last_indexed_file_count)
             ? existingMetadata.last_indexed_file_count
             : null;
+        const lastIndexedFingerprint = typeof existingMetadata?.last_indexed_fingerprint === 'string'
+            ? existingMetadata.last_indexed_fingerprint
+            : null;
         const scanDecision = decideScanMode({
             allowFastSkip,
             lastIndexedFileCount,
-            currentIndexedFileCount
+            currentIndexedFileCount,
+            lastIndexedFingerprint,
+            currentIndexedFingerprint
         });
 
         setScanStatusRunning(activeProfileName, 0);
@@ -527,7 +766,7 @@ async function runScanJob({ updateBootstrapStatus = false, allowFastSkip = false
         };
         appendScanLog(completionLine);
         console.log(completionLine);
-        upsertScanMetadata(activeProfileName, currentIndexedFileCount);
+        upsertScanMetadata(activeProfileName, currentIndexedFileCount, currentIndexedFingerprint);
 
         if (updateBootstrapStatus) {
             bootstrapStatus = {
@@ -623,6 +862,7 @@ app.post('/api/profiles/switch', async (req, res) => {
 
         // Reinitialize database for new profile
         initDatabase();
+        startProfileWatcher();
 
         const scanResult = await runScanJob({
             allowFastSkip: true,
@@ -994,13 +1234,30 @@ app.get('/api/media', async (req, res) => {
     // If thumbnail requested and it's an image, resize on-the-fly
     if (thumbnail && isImage) {
         try {
+            const stat = fs.statSync(filePath);
+            const cacheKey = `${filePath}|${Math.trunc(stat.mtimeMs)}|${stat.size}`;
+            const cached = thumbnailCache.get(cacheKey);
+            const now = Date.now();
+
+            if (cached && (now - cached.createdAt) < THUMBNAIL_CACHE_TTL_MS) {
+                res.set('Content-Type', 'image/webp');
+                res.set('Cache-Control', 'public, max-age=31536000, immutable');
+                return res.send(cached.buffer);
+            }
+
             const resized = await sharp(filePath)
-                .resize(400, 600, { fit: 'cover', position: 'center' })
-                .jpeg({ quality: 80 })
+                .resize(400, 600, { fit: 'cover', position: 'center', withoutEnlargement: true })
+                .webp({ quality: 78 })
                 .toBuffer();
+
+            thumbnailCache.set(cacheKey, { buffer: resized, createdAt: now });
+            if (thumbnailCache.size > MAX_THUMBNAIL_CACHE_SIZE) {
+                const oldestKey = thumbnailCache.keys().next().value;
+                thumbnailCache.delete(oldestKey);
+            }
             
-            res.set('Content-Type', 'image/jpeg');
-            res.set('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
+            res.set('Content-Type', 'image/webp');
+            res.set('Cache-Control', 'public, max-age=31536000, immutable');
             res.send(resized);
         } catch (err) {
             // If resize fails, fall back to original
@@ -1019,5 +1276,6 @@ app.get('/api/media', async (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    startProfileWatcher();
     void startBootstrapSync();
 });
