@@ -853,6 +853,7 @@ export default function App() {
           <span className="ml-2"><code className="bg-gray-800 px-1 py-0.5 rounded">tag1,tag2</code> = AND (both required)</span>
           <span className="ml-3"><code className="bg-gray-800 px-1 py-0.5 rounded">tag1|tag2</code> = OR (at least one)</span>
           <span className="ml-3"><code className="bg-gray-800 px-1 py-0.5 rounded">-tag3</code> = NOT (exclude)</span>
+          <span className="ml-3"><code className="bg-gray-800 px-1 py-0.5 rounded">(male|-female),nsfw</code> = NSFW and (Male or not Female)</span>
         </div>
       </div>
 

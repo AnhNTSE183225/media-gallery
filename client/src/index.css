@@ -7,12 +7,12 @@ html {
 body {
 	margin: 0;
 	background: #111827;
-	overflow: hidden;
+	overflow-y: auto;
 }
 
 .media-gallery-app {
 	min-height: 100vh;
-	overflow: hidden;
+	overflow-y: auto;
 }
 
 .media-gallery-app .gallery-toolbar {
@@ -31,7 +31,7 @@ body {
 	}
 
 	.media-gallery-app {
-		height: 100vh;
+		min-height: 100vh;
 		padding: 0.75rem;
 	}
 
@@ -41,7 +41,13 @@ body {
 	}
 
 	.media-gallery-app .gallery-search-help {
-		display: none;
+		display: block;
+		font-size: 0.625rem;
+		line-height: 1.2;
+		padding-left: 0;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	.media-gallery-app .gallery-grid {
@@ -58,7 +64,17 @@ body {
 	}
 
 	.media-gallery-app .gallery-card-tags {
-		display: none;
+		display: flex;
+		flex-wrap: wrap;
+		row-gap: 0.2rem;
+		gap: 0.2rem;
+		margin-top: 0.25rem;
+	}
+
+	.media-gallery-app .gallery-card-tags span {
+		font-size: 0.5rem;
+		line-height: 1.05;
+		padding: 0.06rem 0.22rem;
 	}
 
 	.media-gallery-app .pagination-bar {

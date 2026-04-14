@@ -931,51 +931,132 @@ function normalizeTagToken(value) {
         .toLowerCase();
 }
 
-function isNegationToken(value) {
-    if (typeof value !== 'string' || value.length === 0) return false;
-    const firstChar = value[0];
-    return firstChar === '-' || firstChar === '−' || firstChar === '–' || firstChar === '—';
+function splitByTopLevelDelimiter(input, delimiterChar) {
+    const segments = [];
+    let current = '';
+    let depth = 0;
+
+    for (const char of input) {
+        if (char === '(') {
+            depth += 1;
+            current += char;
+            continue;
+        }
+
+        if (char === ')') {
+            depth = Math.max(0, depth - 1);
+            current += char;
+            continue;
+        }
+
+        if (char === delimiterChar && depth === 0) {
+            segments.push(current);
+            current = '';
+            continue;
+        }
+
+        current += char;
+    }
+
+    segments.push(current);
+    return segments;
+}
+
+function stripOuterParentheses(value) {
+    let result = value.trim();
+
+    while (result.startsWith('(') && result.endsWith(')')) {
+        let depth = 0;
+        let closesAtEnd = true;
+
+        for (let i = 0; i < result.length; i += 1) {
+            const char = result[i];
+            if (char === '(') depth += 1;
+            if (char === ')') {
+                depth -= 1;
+                if (depth === 0 && i < result.length - 1) {
+                    closesAtEnd = false;
+                    break;
+                }
+            }
+            if (depth < 0) {
+                closesAtEnd = false;
+                break;
+            }
+        }
+
+        if (!closesAtEnd || depth !== 0) {
+            break;
+        }
+
+        result = result.slice(1, -1).trim();
+    }
+
+    return result;
+}
+
+function parseLiteralToken(value) {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+
+    const firstChar = trimmed[0];
+    const isNegated = firstChar === '-' || firstChar === '−' || firstChar === '–' || firstChar === '—';
+    const token = isNegated ? trimmed.slice(1) : trimmed;
+    const normalizedTag = normalizeTagToken(token);
+
+    if (!normalizedTag) return null;
+    return {
+        tag: normalizedTag,
+        negated: isNegated
+    };
 }
 
 function parseTagQuery(queryString) {
     if (typeof queryString !== 'string' || queryString.trim() === '') {
-        return { and: [], or: [], not: [] };
+        return {
+            clauses: [],
+            literalCount: 0
+        };
     }
 
-    const result = { and: [], or: [], not: [] };
     const normalizedQuery = queryString
         .replace(/[，、؛]/g, ',')
         .replace(/[\u200B-\u200D\uFEFF]/g, '');
-    const parts = normalizedQuery.split(',').map(t => t.trim()).filter(Boolean);
+    const clauseSegments = splitByTopLevelDelimiter(normalizedQuery, ',')
+        .map(segment => segment.trim())
+        .filter(Boolean);
 
-    for (const part of parts) {
-        if (isNegationToken(part)) {
-            const notTag = normalizeTagToken(part.slice(1));
-            if (notTag) {
-                result.not.push(notTag);
-            }
-            continue;
+    const clauses = [];
+
+    for (const rawClause of clauseSegments) {
+        const clauseWithoutParens = stripOuterParentheses(rawClause);
+        const rawLiterals = splitByTopLevelDelimiter(clauseWithoutParens, '|')
+            .map(token => stripOuterParentheses(token))
+            .map(token => token.trim())
+            .filter(Boolean);
+
+        const literals = [];
+        const seenLiteralKeys = new Set();
+
+        for (const rawLiteral of rawLiterals) {
+            const parsedLiteral = parseLiteralToken(rawLiteral);
+            if (!parsedLiteral) continue;
+
+            const dedupeKey = `${parsedLiteral.negated ? '!' : '+'}:${parsedLiteral.tag}`;
+            if (seenLiteralKeys.has(dedupeKey)) continue;
+
+            seenLiteralKeys.add(dedupeKey);
+            literals.push(parsedLiteral);
         }
 
-        if (part.includes('|')) {
-            const orTags = part
-                .split('|')
-                .map(t => normalizeTagToken(t))
-                .filter(Boolean);
-            result.or.push(...orTags);
-            continue;
-        }
-
-        const andTag = normalizeTagToken(part);
-        if (andTag) {
-            result.and.push(andTag);
+        if (literals.length > 0) {
+            clauses.push({ literals });
         }
     }
 
     return {
-        and: [...new Set(result.and)],
-        or: [...new Set(result.or)],
-        not: [...new Set(result.not)]
+        clauses,
+        literalCount: clauses.reduce((sum, clause) => sum + clause.literals.length, 0)
     };
 }
 
@@ -1026,47 +1107,34 @@ function parseSearchPagination(rawPage, rawLimit) {
 function buildTagQueryPlan(parsedQuery) {
     const whereClauses = [];
     const whereParams = [];
-    const havingParams = [];
 
-    let joinClause = '';
-    let havingClause = '';
+    for (const clause of parsedQuery.clauses) {
+        const literalConditions = [];
 
-    const includeTags = [...parsedQuery.and, ...parsedQuery.or];
-    if (includeTags.length > 0) {
-        joinClause = ' JOIN asset_tags at ON a.id = at.asset_id';
+        for (const literal of clause.literals) {
+            if (literal.negated) {
+                literalConditions.push(`NOT EXISTS (
+                    SELECT 1 FROM asset_tags at_neg
+                    WHERE at_neg.asset_id = a.id AND LOWER(TRIM(at_neg.tag)) = ?
+                )`);
+            } else {
+                literalConditions.push(`EXISTS (
+                    SELECT 1 FROM asset_tags at_pos
+                    WHERE at_pos.asset_id = a.id AND LOWER(TRIM(at_pos.tag)) = ?
+                )`);
+            }
 
-        const includePlaceholders = includeTags.map(() => '?').join(',');
-        whereClauses.push(`LOWER(TRIM(at.tag)) IN (${includePlaceholders})`);
-        whereParams.push(...includeTags);
+            whereParams.push(literal.tag);
+        }
 
-        if (parsedQuery.and.length > 0 && parsedQuery.or.length > 0) {
-            havingClause = `GROUP BY a.id HAVING
-                COUNT(DISTINCT CASE WHEN LOWER(TRIM(at.tag)) IN (${parsedQuery.and.map(() => '?').join(',')}) THEN LOWER(TRIM(at.tag)) END) = ?
-                AND SUM(CASE WHEN LOWER(TRIM(at.tag)) IN (${parsedQuery.or.map(() => '?').join(',')}) THEN 1 ELSE 0 END) >= 1`;
-            havingParams.push(...parsedQuery.and, parsedQuery.and.length, ...parsedQuery.or);
-        } else if (parsedQuery.and.length > 0) {
-            havingClause = `GROUP BY a.id HAVING
-                COUNT(DISTINCT CASE WHEN LOWER(TRIM(at.tag)) IN (${parsedQuery.and.map(() => '?').join(',')}) THEN LOWER(TRIM(at.tag)) END) = ?`;
-            havingParams.push(...parsedQuery.and, parsedQuery.and.length);
-        } else {
-            havingClause = 'GROUP BY a.id';
+        if (literalConditions.length > 0) {
+            whereClauses.push(`(${literalConditions.join(' OR ')})`);
         }
     }
 
-    if (parsedQuery.not.length > 0) {
-        const notPlaceholders = parsedQuery.not.map(() => '?').join(',');
-        whereClauses.push(`a.id NOT IN (
-            SELECT asset_id FROM asset_tags WHERE LOWER(TRIM(tag)) IN (${notPlaceholders})
-        )`);
-        whereParams.push(...parsedQuery.not);
-    }
-
     return {
-        joinClause,
         whereClauses,
-        whereParams,
-        havingClause,
-        havingParams
+        whereParams
     };
 }
 
@@ -1075,7 +1143,7 @@ function buildSearchQueryPlan({ rawTagQuery, rawTextQuery }) {
     const MAX_SEARCH_TEXT_LENGTH = 200;
 
     const parsedTagQuery = parseTagQuery(normalizeQueryStringValue(rawTagQuery));
-    const totalTagCount = parsedTagQuery.and.length + parsedTagQuery.or.length + parsedTagQuery.not.length;
+    const totalTagCount = parsedTagQuery.literalCount;
 
     if (totalTagCount > MAX_SEARCH_TAGS) {
         const err = new Error(`Too many tag filters. Maximum allowed is ${MAX_SEARCH_TAGS}.`);
@@ -1095,7 +1163,6 @@ function buildSearchQueryPlan({ rawTagQuery, rawTextQuery }) {
     const whereClauses = [];
 
     const tagPlan = buildTagQueryPlan(parsedTagQuery);
-    sql += tagPlan.joinClause;
     whereClauses.push(...tagPlan.whereClauses);
     params.push(...tagPlan.whereParams);
 
@@ -1107,11 +1174,6 @@ function buildSearchQueryPlan({ rawTagQuery, rawTextQuery }) {
 
     if (whereClauses.length > 0) {
         sql += ` WHERE ${whereClauses.join(' AND ')}`;
-    }
-
-    if (tagPlan.havingClause) {
-        sql += ` ${tagPlan.havingClause}`;
-        params.push(...tagPlan.havingParams);
     }
 
     assertSqlParamAlignment(sql, params);
