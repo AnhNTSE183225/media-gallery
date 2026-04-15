@@ -69,6 +69,16 @@ function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
 
+const SEARCH_SORT_BY = {
+    NAME: 'name',
+    MODIFIED_AT: 'modifiedAt'
+};
+
+const SEARCH_SORT_ORDER = {
+    ASC: 'asc',
+    DESC: 'desc'
+};
+
 function normalizeKeyArray(value, fallback) {
     if (!Array.isArray(value)) return fallback;
     const keys = value
@@ -191,6 +201,7 @@ function initDatabase() {
         artist TEXT,
         name TEXT,       -- filename for images, folder name for stories
         pages TEXT,      -- JSON array of file paths if it is a story
+                modified_at INTEGER DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS asset_tags (
@@ -205,6 +216,7 @@ function initDatabase() {
                 last_successful_scan_at DATETIME NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_assets_artist_name ON assets(artist, name);
+            CREATE INDEX IF NOT EXISTS idx_assets_modified_at ON assets(modified_at);
             CREATE INDEX IF NOT EXISTS idx_asset_tags_tag ON asset_tags(tag);
             CREATE INDEX IF NOT EXISTS idx_asset_tags_asset_tag ON asset_tags(asset_id, tag);
     `);
@@ -215,9 +227,23 @@ function initDatabase() {
     } catch (err) {
         // Ignore duplicate-column errors on already-migrated databases.
     }
+
+    // Backward-compatible migration for modified timestamp sorting.
+    try {
+        db.exec('ALTER TABLE assets ADD COLUMN modified_at INTEGER DEFAULT 0');
+    } catch (err) {
+        // Ignore duplicate-column errors on already-migrated databases.
+    }
+
+    // Fill missing values to keep sorting deterministic before a full rescan.
+    db.prepare(`
+        UPDATE assets
+        SET modified_at = CAST(strftime('%s', created_at) AS INTEGER) * 1000
+        WHERE modified_at IS NULL OR modified_at = 0
+    `).run();
     
     // Create/recreate prepared statements for the new database connection
-    insertAsset = db.prepare(`INSERT OR REPLACE INTO assets (path, type, artist, name, pages) VALUES (?, ?, ?, ?, ?)`);
+    insertAsset = db.prepare(`INSERT OR REPLACE INTO assets (path, type, artist, name, pages, modified_at) VALUES (?, ?, ?, ?, ?, ?)`);
     insertTag = db.prepare(`INSERT INTO asset_tags (asset_id, tag) VALUES (?, ?)`);
 }
 
@@ -432,7 +458,8 @@ async function scanDirectory(dirPath, artistName = null, currentTags = [], scanC
                 const storyPages = getFilesRecursively(fullPath);
 
                 if (storyPages.length > 0) {
-                    const result = insertAsset.run(fullPath, 'story', artistName, item, JSON.stringify(storyPages));
+                    const modifiedAt = getStoryModifiedTime(fullPath, storyPages);
+                    const result = insertAsset.run(fullPath, 'story', artistName, item, JSON.stringify(storyPages), modifiedAt);
                     // Tags are auto-deleted by ON DELETE CASCADE if replaced
                     // Add "Story" tag automatically
                     insertTag.run(result.lastInsertRowid, 'Story');
@@ -444,7 +471,8 @@ async function scanDirectory(dirPath, artistName = null, currentTags = [], scanC
         } else {
             // It is a File -> It is a STANDALONE IMAGE
             if (artistName && getActiveProfile().allowedExtensions.includes(path.extname(item).toLowerCase())) {
-                const result = insertAsset.run(fullPath, 'image', artistName, item, null);
+                const modifiedAt = Math.trunc(stat.mtimeMs);
+                const result = insertAsset.run(fullPath, 'image', artistName, item, null, modifiedAt);
                 // Tags are auto-deleted by ON DELETE CASCADE if replaced
                 // Deduplicate tags before inserting
                 const uniqueTags = [...new Set(currentTags)];
@@ -521,6 +549,28 @@ function countIndexableFilesSummary(dirPath, allowedExtensions) {
 
     const fingerprint = `${count}-${Math.trunc(latestMtime)}`;
     return { count, fingerprint };
+}
+
+function getStoryModifiedTime(storyDirectoryPath, storyPages = []) {
+    let latestMtimeMs = 0;
+
+    if (storyDirectoryPath) {
+        try {
+            latestMtimeMs = Math.max(latestMtimeMs, fs.statSync(storyDirectoryPath).mtimeMs);
+        } catch {
+            // Keep fallback value when story folder cannot be stat-ed.
+        }
+    }
+
+    for (const storyPagePath of storyPages) {
+        try {
+            latestMtimeMs = Math.max(latestMtimeMs, fs.statSync(storyPagePath).mtimeMs);
+        } catch {
+            // Skip missing files during scan races.
+        }
+    }
+
+    return Math.trunc(latestMtimeMs);
 }
 
 function getArtistFromPath(filePathCandidate, rootDirectory) {
@@ -1104,6 +1154,31 @@ function parseSearchPagination(rawPage, rawLimit) {
     };
 }
 
+function parseSearchSort(rawSortBy, rawSortOrder) {
+    const sortByCandidate = typeof rawSortBy === 'string' ? rawSortBy.trim() : '';
+    const sortOrderCandidate = typeof rawSortOrder === 'string' ? rawSortOrder.trim().toLowerCase() : '';
+
+    const sortBy = sortByCandidate === SEARCH_SORT_BY.MODIFIED_AT
+        ? SEARCH_SORT_BY.MODIFIED_AT
+        : SEARCH_SORT_BY.NAME;
+
+    const sortOrder = sortOrderCandidate === SEARCH_SORT_ORDER.DESC
+        ? SEARCH_SORT_ORDER.DESC
+        : SEARCH_SORT_ORDER.ASC;
+
+    const direction = sortOrder === SEARCH_SORT_ORDER.DESC ? 'DESC' : 'ASC';
+
+    const orderBySql = sortBy === SEARCH_SORT_BY.MODIFIED_AT
+        ? `filtered_results.modified_at ${direction}, filtered_results.artist ${direction}, filtered_results.name ${direction}, filtered_results.id ${direction}`
+        : `filtered_results.artist ${direction}, filtered_results.name ${direction}, filtered_results.id ${direction}`;
+
+    return {
+        sortBy,
+        sortOrder,
+        orderBySql
+    };
+}
+
 function buildTagQueryPlan(parsedQuery) {
     const whereClauses = [];
     const whereParams = [];
@@ -1202,7 +1277,9 @@ app.get('/api/search', (req, res) => {
         q: normalizeQueryStringValue(req.query.q),
         text: normalizeTextQueryValue(req.query.text),
         page: req.query.page ?? null,
-        limit: req.query.limit ?? null
+        limit: req.query.limit ?? null,
+        sortBy: req.query.sortBy ?? null,
+        sortOrder: req.query.sortOrder ?? null
     });
 
     try {
@@ -1212,6 +1289,7 @@ app.get('/api/search', (req, res) => {
         });
 
         const { page, limit, offset } = parseSearchPagination(req.query.page, req.query.limit);
+        const sortPlan = parseSearchSort(req.query.sortBy, req.query.sortOrder);
 
         const countSql = `SELECT COUNT(*) as total FROM (${queryPlan.sql}) as filtered_results`;
         const totalRow = db.prepare(countSql).get(...queryPlan.params);
@@ -1220,6 +1298,7 @@ app.get('/api/search', (req, res) => {
         const paginatedSql = `
             SELECT *
             FROM (${queryPlan.sql}) as filtered_results
+            ORDER BY ${sortPlan.orderBySql}
             LIMIT ? OFFSET ?
         `;
         const rows = db.prepare(paginatedSql).all(...queryPlan.params, limit, offset);
@@ -1230,21 +1309,17 @@ app.get('/api/search', (req, res) => {
             limit,
             offset,
             total,
+            sortBy: sortPlan.sortBy,
+            sortOrder: sortPlan.sortOrder,
             rowCount: rows.length
         });
 
         const items = rows.map(r => ({
             ...r,
             pages: r.pages ? JSON.parse(r.pages) : null,
-            tags: r.tags ? r.tags.split(',') : []
+            tags: r.tags ? r.tags.split(',') : [],
+            modifiedAt: Number(r.modified_at) || 0
         }));
-
-        // Sort with numeric ordering for natural file/folder names (1, 2, 10, 11 not 1, 10, 11, 2)
-        items.sort((a, b) => {
-            const artistCompare = a.artist.localeCompare(b.artist, undefined, { numeric: true, sensitivity: 'base' });
-            if (artistCompare !== 0) return artistCompare;
-            return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        });
 
         res.json({
             items,
@@ -1253,6 +1328,10 @@ app.get('/api/search', (req, res) => {
                 page,
                 limit,
                 totalPages: Math.ceil(total / limit)
+            },
+            sort: {
+                sortBy: sortPlan.sortBy,
+                sortOrder: sortPlan.sortOrder
             }
         });
 
@@ -1261,6 +1340,8 @@ app.get('/api/search', (req, res) => {
             total,
             returned: items.length,
             page,
+            sortBy: sortPlan.sortBy,
+            sortOrder: sortPlan.sortOrder,
             totalPages: Math.ceil(total / limit)
         });
     } catch (err) {

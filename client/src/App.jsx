@@ -28,6 +28,16 @@ const DEFAULT_SCAN_STATUS = {
   recentLogs: []
 };
 
+const SORT_BY_OPTIONS = {
+  name: 'name',
+  modifiedAt: 'modifiedAt'
+};
+
+const SORT_ORDER_OPTIONS = {
+  asc: 'asc',
+  desc: 'desc'
+};
+
 const normalizeKeyArray = (value, fallback) => {
   if (!Array.isArray(value)) return fallback;
   const keys = value
@@ -210,6 +220,10 @@ export default function App() {
   const urlTextQuery = searchParams.get('text') || '';
   const rawUrlPage = Number.parseInt(searchParams.get('page') || '1', 10);
   const urlPage = Number.isFinite(rawUrlPage) && rawUrlPage > 0 ? rawUrlPage : 1;
+  const rawUrlSortBy = searchParams.get('sortBy') || SORT_BY_OPTIONS.name;
+  const urlSortBy = rawUrlSortBy === SORT_BY_OPTIONS.modifiedAt ? SORT_BY_OPTIONS.modifiedAt : SORT_BY_OPTIONS.name;
+  const rawUrlSortOrder = (searchParams.get('sortOrder') || SORT_ORDER_OPTIONS.asc).toLowerCase();
+  const urlSortOrder = rawUrlSortOrder === SORT_ORDER_OPTIONS.desc ? SORT_ORDER_OPTIONS.desc : SORT_ORDER_OPTIONS.asc;
 
   const fetchProfiles = async () => {
     try {
@@ -261,7 +275,13 @@ export default function App() {
       
       // Refresh results for new profile
       const page = parseInt(searchParams.get('page')) || 1;
-      await fetchResults(query, searchParams.get('text') || '', page);
+      await fetchResults(
+        query,
+        searchParams.get('text') || '',
+        page,
+        searchParams.get('sortBy') || SORT_BY_OPTIONS.name,
+        (searchParams.get('sortOrder') || SORT_ORDER_OPTIONS.asc).toLowerCase()
+      );
     } catch (err) {
       console.error('Error switching profile:', err);
       const errorMessage = err.response?.data?.error || 'Failed to switch profile';
@@ -271,14 +291,16 @@ export default function App() {
     }
   };
 
-  const fetchResults = useCallback(async (tagQuery, textQuery, page) => {
+  const fetchResults = useCallback(async (tagQuery, textQuery, page, sortBy, sortOrder) => {
     try {
       const res = await axios.get(`${API_URL}/search`, {
         params: {
           q: tagQuery,
           text: textQuery,
           page,
-          limit: appConfig.itemsPerPage
+          limit: appConfig.itemsPerPage,
+          sortBy,
+          sortOrder
         }
       });
       setItems(res.data.items || []);
@@ -296,11 +318,28 @@ export default function App() {
     setTextSearch(urlTextQuery);
   }, [isBootstrapping, urlTagQuery, urlTextQuery]);
 
-  // Fetch only when search-relevant URL params change (q/text/page), not viewer params (i/p).
+  useEffect(() => {
+    const hasSortBy = searchParams.has('sortBy');
+    const hasSortOrder = searchParams.has('sortOrder');
+    if (hasSortBy && hasSortOrder) return;
+
+    setSearchParams(prev => {
+      const newParams = new URLSearchParams(prev);
+      if (!hasSortBy) {
+        newParams.set('sortBy', SORT_BY_OPTIONS.name);
+      }
+      if (!hasSortOrder) {
+        newParams.set('sortOrder', SORT_ORDER_OPTIONS.asc);
+      }
+      return newParams;
+    });
+  }, [searchParams, setSearchParams]);
+
+  // Fetch only when search-relevant URL params change (q/text/page/sort), not viewer params (i/p).
   useEffect(() => {
     if (isBootstrapping) return;
-    fetchResults(urlTagQuery, urlTextQuery, urlPage);
-  }, [isBootstrapping, fetchResults, urlTagQuery, urlTextQuery, urlPage]);
+    fetchResults(urlTagQuery, urlTextQuery, urlPage, urlSortBy, urlSortOrder);
+  }, [isBootstrapping, fetchResults, urlTagQuery, urlTextQuery, urlPage, urlSortBy, urlSortOrder]);
 
   useEffect(() => {
     let isCancelled = false;
@@ -387,7 +426,13 @@ export default function App() {
     try {
       await axios.post(`${API_URL}/scan`);
       const page = parseInt(searchParams.get('page')) || 1;
-      await fetchResults(query, searchParams.get('text') || '', page);
+      await fetchResults(
+        query,
+        searchParams.get('text') || '',
+        page,
+        searchParams.get('sortBy') || SORT_BY_OPTIONS.name,
+        (searchParams.get('sortOrder') || SORT_ORDER_OPTIONS.asc).toLowerCase()
+      );
       setToast({ message: 'Scan complete! Results refreshed.', loading: false });
     } catch (err) {
       console.error('Scan error:', err);
@@ -408,6 +453,34 @@ export default function App() {
       return newParams;
     });
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleSortByChange = (sortBy) => {
+    setSearchParams(prev => {
+      const newParams = new URLSearchParams(prev);
+      newParams.set('sortBy', sortBy);
+      if (!newParams.has('sortOrder')) {
+        newParams.set('sortOrder', SORT_ORDER_OPTIONS.asc);
+      }
+      newParams.delete('page');
+      newParams.delete('i');
+      newParams.delete('p');
+      return newParams;
+    });
+  };
+
+  const handleSortOrderChange = (sortOrder) => {
+    setSearchParams(prev => {
+      const newParams = new URLSearchParams(prev);
+      if (!newParams.has('sortBy')) {
+        newParams.set('sortBy', SORT_BY_OPTIONS.name);
+      }
+      newParams.set('sortOrder', sortOrder);
+      newParams.delete('page');
+      newParams.delete('i');
+      newParams.delete('p');
+      return newParams;
+    });
   };
 
   // --- NAVIGATION LOGIC ---
@@ -822,6 +895,26 @@ export default function App() {
               />
               <button type="submit" className="hidden">Search</button>
             </form>
+
+            <div className="flex items-center gap-2 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm whitespace-nowrap">
+              <span className="text-gray-300 text-xs uppercase tracking-wide">Sort</span>
+              <select
+                value={urlSortBy}
+                onChange={(e) => handleSortByChange(e.target.value)}
+                className="bg-gray-900 px-2 py-1 rounded border border-gray-700 focus:outline-none focus:border-blue-500"
+              >
+                <option value={SORT_BY_OPTIONS.name}>Artist Name</option>
+                <option value={SORT_BY_OPTIONS.modifiedAt}>Date Modified</option>
+              </select>
+              <select
+                value={urlSortOrder}
+                onChange={(e) => handleSortOrderChange(e.target.value)}
+                className="bg-gray-900 px-2 py-1 rounded border border-gray-700 focus:outline-none focus:border-blue-500"
+              >
+                <option value={SORT_ORDER_OPTIONS.asc}>Ascending</option>
+                <option value={SORT_ORDER_OPTIONS.desc}>Descending</option>
+              </select>
+            </div>
 
             {totalPages > 1 && (
               <div className="hidden lg:flex items-center gap-2 px-2 py-1 bg-gray-800 rounded border border-gray-700 whitespace-nowrap text-sm">
