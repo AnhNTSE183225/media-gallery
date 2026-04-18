@@ -3,6 +3,9 @@ const Database = require('better-sqlite3');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
 const sharp = require('sharp');
 const chokidar = require('chokidar');
 const { load: parseYaml } = require('js-yaml');
@@ -180,9 +183,141 @@ let insertTag;
 const thumbnailCache = new Map();
 const MAX_THUMBNAIL_CACHE_SIZE = 300;
 const THUMBNAIL_CACHE_TTL_MS = 15 * 60 * 1000;
+const VIDEO_TRANSCODE_CACHE_DIR = path.join(os.tmpdir(), 'mediagallery-transcoded-videos');
+const videoTranscodePromises = new Map();
 let profileWatcher = null;
 let incrementalScanTimer = null;
 const pendingArtistSync = new Set();
+
+function ensureDirectory(dirPath) {
+    if (!fs.existsSync(dirPath)) {
+        fs.mkdirSync(dirPath, { recursive: true });
+    }
+}
+
+function getFileSignature(filePath) {
+    const stat = fs.statSync(filePath);
+    return {
+        mtimeMs: Math.trunc(stat.mtimeMs),
+        size: stat.size
+    };
+}
+
+function getVideoTranscodePath(filePath) {
+    const signature = getFileSignature(filePath);
+    const hash = crypto.createHash('sha1')
+        .update(`${filePath}|${signature.mtimeMs}|${signature.size}`)
+        .digest('hex');
+
+    return path.join(VIDEO_TRANSCODE_CACHE_DIR, `${hash}.mp4`);
+}
+
+function runFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+        const child = spawn('ffmpeg', ['-y', ...args], {
+            stdio: ['ignore', 'ignore', 'pipe']
+        });
+        let stderr = '';
+
+        child.stderr.on('data', (chunk) => {
+            stderr += chunk.toString();
+        });
+
+        child.on('error', reject);
+        child.on('close', (code) => {
+            if (code === 0) {
+                resolve();
+                return;
+            }
+
+            reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`));
+        });
+    });
+}
+
+async function getPlayableVideoPath(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext !== '.mkv') {
+        return filePath;
+    }
+
+    ensureDirectory(VIDEO_TRANSCODE_CACHE_DIR);
+    const targetPath = getVideoTranscodePath(filePath);
+
+    if (fs.existsSync(targetPath)) {
+        return targetPath;
+    }
+
+    const pending = videoTranscodePromises.get(targetPath);
+    if (pending) {
+        return pending;
+    }
+
+    const transcodePromise = (async () => {
+        const tempPath = `${targetPath}.tmp-${process.pid}-${Date.now()}.mp4`;
+
+        const buildArgs = (videoCodec, audioCodec) => ([
+            '-i', filePath,
+            '-map', '0:v:0?',
+            '-map', '0:a?',
+            '-dn',
+            '-sn',
+            '-c:v', videoCodec,
+            '-c:a', audioCodec,
+            '-f', 'mp4',
+            '-movflags', '+faststart',
+            tempPath
+        ]);
+
+        try {
+            await runFfmpeg(buildArgs('copy', 'copy'));
+        } catch (copyErr) {
+            try {
+                if (fs.existsSync(tempPath)) {
+                    fs.unlinkSync(tempPath);
+                }
+            } catch {
+                // Ignore cleanup errors.
+            }
+
+            try {
+                await runFfmpeg([
+                    '-i', filePath,
+                    '-map', '0:v:0?',
+                    '-map', '0:a?',
+                    '-dn',
+                    '-sn',
+                    '-c:v', 'libx264',
+                    '-preset', 'veryfast',
+                    '-crf', '23',
+                    '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac',
+                    '-f', 'mp4',
+                    '-movflags', '+faststart',
+                    tempPath
+                ]);
+            } catch (transcodeErr) {
+                try {
+                    if (fs.existsSync(tempPath)) {
+                        fs.unlinkSync(tempPath);
+                    }
+                } catch {
+                    // Ignore cleanup errors.
+                }
+
+                throw new Error(`Unable to prepare MKV for browser playback: ${transcodeErr.message || copyErr.message}`);
+            }
+        }
+
+        fs.renameSync(tempPath, targetPath);
+        return targetPath;
+    })().finally(() => {
+        videoTranscodePromises.delete(targetPath);
+    });
+
+    videoTranscodePromises.set(targetPath, transcodePromise);
+    return transcodePromise;
+}
 
 // Initialize database for current profile
 function initDatabase() {
@@ -1412,10 +1547,14 @@ app.get('/api/media', async (req, res) => {
         }
     } else {
         // Videos and full-size images
-        res.sendFile(filePath, { dotfiles: 'allow' }, (err) => {
+        const playablePath = isVideo && ext === '.mkv'
+            ? await getPlayableVideoPath(filePath)
+            : filePath;
+
+        res.sendFile(playablePath, { dotfiles: 'allow' }, (err) => {
             // Suppress normal client-aborted errors (happens with video seeking/scrolling)
             if (err && err.code !== 'ECONNABORTED' && err.code !== 'ECANCELED') {
-                console.error(`Media Error sending ${filePath}:`, err);
+                console.error(`Media Error sending ${playablePath}:`, err);
             }
         });
     }

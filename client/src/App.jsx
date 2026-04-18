@@ -1036,7 +1036,7 @@ export default function App() {
                 ? currentItem.pages[storyPageIndex]
                 : currentItem.path;
 
-              const isVideo = pathToShow.endsWith('.mp4') || pathToShow.endsWith('.webm');
+              const isVideo = /\.(mp4|webm|mkv|mov)$/i.test(pathToShow);
 
               if (isVideo) {
                 return (
