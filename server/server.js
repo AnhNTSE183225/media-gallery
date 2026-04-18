@@ -20,6 +20,8 @@ const DEFAULT_APP_CONFIG = {
         previous: ['Digit1'],
         next: ['Digit2'],
         close: ['Escape'],
+        seekBackward: ['ArrowLeft'],
+        seekForward: ['ArrowRight'],
         fitWidth: ['KeyW'],
         fitHeight: ['KeyH'],
         fitDefault: ['KeyC']
@@ -106,6 +108,8 @@ function normalizeAppConfig(rawConfig) {
             previous: normalizeKeyArray(rawConfig?.keybinds?.previous, DEFAULT_APP_CONFIG.keybinds.previous),
             next: normalizeKeyArray(rawConfig?.keybinds?.next, DEFAULT_APP_CONFIG.keybinds.next),
             close: normalizeKeyArray(rawConfig?.keybinds?.close, DEFAULT_APP_CONFIG.keybinds.close),
+            seekBackward: normalizeKeyArray(rawConfig?.keybinds?.seekBackward, DEFAULT_APP_CONFIG.keybinds.seekBackward),
+            seekForward: normalizeKeyArray(rawConfig?.keybinds?.seekForward, DEFAULT_APP_CONFIG.keybinds.seekForward),
             fitWidth: normalizeKeyArray(rawConfig?.keybinds?.fitWidth, DEFAULT_APP_CONFIG.keybinds.fitWidth),
             fitHeight: normalizeKeyArray(rawConfig?.keybinds?.fitHeight, DEFAULT_APP_CONFIG.keybinds.fitHeight),
             fitDefault: normalizeKeyArray(rawConfig?.keybinds?.fitDefault, DEFAULT_APP_CONFIG.keybinds.fitDefault)

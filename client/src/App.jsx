@@ -12,6 +12,8 @@ const DEFAULT_APP_CONFIG = {
     previous: ['Digit1'],
     next: ['Digit2'],
     close: ['Escape'],
+    seekBackward: ['ArrowLeft'],
+    seekForward: ['ArrowRight'],
     fitWidth: ['KeyW'],
     fitHeight: ['KeyH'],
     fitDefault: ['KeyC']
@@ -65,6 +67,8 @@ const normalizeAppConfig = (rawConfig) => {
       previous: normalizeKeyArray(rawConfig?.keybinds?.previous, DEFAULT_APP_CONFIG.keybinds.previous),
       next: normalizeKeyArray(rawConfig?.keybinds?.next, DEFAULT_APP_CONFIG.keybinds.next),
       close: normalizeKeyArray(rawConfig?.keybinds?.close, DEFAULT_APP_CONFIG.keybinds.close),
+      seekBackward: normalizeKeyArray(rawConfig?.keybinds?.seekBackward, DEFAULT_APP_CONFIG.keybinds.seekBackward),
+      seekForward: normalizeKeyArray(rawConfig?.keybinds?.seekForward, DEFAULT_APP_CONFIG.keybinds.seekForward),
       fitWidth: normalizeKeyArray(rawConfig?.keybinds?.fitWidth, DEFAULT_APP_CONFIG.keybinds.fitWidth),
       fitHeight: normalizeKeyArray(rawConfig?.keybinds?.fitHeight, DEFAULT_APP_CONFIG.keybinds.fitHeight),
       fitDefault: normalizeKeyArray(rawConfig?.keybinds?.fitDefault, DEFAULT_APP_CONFIG.keybinds.fitDefault)
@@ -666,17 +670,19 @@ export default function App() {
     const handleKeyDown = (e) => {
       if (!isFullscreen) return;
       
-      // For videos with arrow keys: custom seeking
+      // For videos with configured seek keys: custom seeking
       const videoElement = videoRef.current;
-      const isArrowKey = e.code === 'ArrowLeft' || e.code === 'ArrowRight';
+      const isSeekBackwardKey = appConfig.keybinds.seekBackward.includes(e.code);
+      const isSeekForwardKey = appConfig.keybinds.seekForward.includes(e.code);
+      const isSeekKey = isSeekBackwardKey || isSeekForwardKey;
       
-      if (videoElement && isArrowKey) {
+      if (videoElement && isSeekKey) {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
         
         const wasPlaying = !videoElement.paused;
-        const skipAmount = e.code === 'ArrowRight'
+        const skipAmount = isSeekForwardKey
           ? appConfig.videoSkipSeconds
           : -appConfig.videoSkipSeconds;
         const newTime = videoElement.currentTime + skipAmount;

@@ -14,6 +14,10 @@ keybinds:
     - Digit2
   close:
     - Escape
+  seekBackward:
+    - KeyA
+  seekForward:
+    - KeyS
   fitWidth:
     - KeyW
   fitHeight:
