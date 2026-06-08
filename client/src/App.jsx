@@ -263,6 +263,7 @@ export default function App() {
   }, []);
   
   const switchProfile = async (profileName) => {
+    setScanStatus(DEFAULT_SCAN_STATUS);
     setIsRescanning(true);
 
     try {
@@ -368,6 +369,7 @@ export default function App() {
     const initializeApp = async () => {
       try {
         setBootstrapError('');
+        setScanStatus(DEFAULT_SCAN_STATUS);
         setIsBootstrapping(true);
         await Promise.all([waitForBootstrap(), fetchAppConfig()]);
         if (isCancelled) return;
@@ -425,6 +427,7 @@ export default function App() {
   };
 
   const triggerScan = async () => {
+    setScanStatus(DEFAULT_SCAN_STATUS);
     setIsRescanning(true);
 
     try {

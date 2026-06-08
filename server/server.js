@@ -74,6 +74,40 @@ function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
 
+function pLimit(concurrency) {
+    const queue = [];
+    let activeCount = 0;
+
+    const next = () => {
+        activeCount--;
+        if (queue.length > 0) {
+            queue.shift()();
+        }
+    };
+
+    const run = async (fn, resolve, reject, args) => {
+        activeCount++;
+        try {
+            const result = await fn(...args);
+            resolve(result);
+        } catch (err) {
+            reject(err);
+        } finally {
+            next();
+        }
+    };
+
+    return (fn, ...args) => new Promise((resolve, reject) => {
+        if (activeCount < concurrency) {
+            run(fn, resolve, reject, args);
+        } else {
+            queue.push(() => run(fn, resolve, reject, args));
+        }
+    });
+}
+
+const fsLimit = pLimit(100);
+
 const SEARCH_SORT_BY = {
     NAME: 'name',
     MODIFIED_AT: 'modifiedAt'
@@ -332,6 +366,10 @@ function initDatabase() {
     // Enable Foreign Keys explicitly
     db.pragma('foreign_keys = ON');
     
+    // Enable Write-Ahead Logging for massively improved concurrent insert performance
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    
     db.exec(`
       CREATE TABLE IF NOT EXISTS assets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -440,7 +478,7 @@ function appendScanLog(line) {
     }
 }
 
-function setScanStatusRunning(profileName, totalArtists) {
+function setScanStatusRunning(profileName, totalArtists, keepLogs = false) {
     scanStatus = {
         status: 'running',
         profile: profileName,
@@ -448,26 +486,35 @@ function setScanStatusRunning(profileName, totalArtists) {
         totalArtists,
         percentage: totalArtists === 0 ? 100 : 0,
         currentArtist: '',
-        startedAt: new Date().toISOString(),
+        startedAt: keepLogs && scanStatus.startedAt ? scanStatus.startedAt : new Date().toISOString(),
         finishedAt: null,
         error: null,
-        recentLogs: []
+        recentLogs: keepLogs ? scanStatus.recentLogs : []
     };
 }
 
-function countArtists(dirPath) {
-    if (!fs.existsSync(dirPath)) return 0;
+async function countArtists(dirPath) {
+    try {
+        const stat = await fsLimit(() => fs.promises.stat(dirPath));
+        if (!stat.isDirectory()) return 0;
+    } catch {
+        return 0;
+    }
 
     try {
-        const items = fs.readdirSync(dirPath);
-        return items.filter(item => {
+        const items = await fsLimit(() => fs.promises.readdir(dirPath));
+        let count = 0;
+        const promises = items.map(async (item) => {
             try {
-                return fs.statSync(path.join(dirPath, item)).isDirectory();
-            } catch (e) {
-                return false;
-            }
-        }).length;
-    } catch (err) {
+                const st = await fsLimit(() => fs.promises.stat(path.join(dirPath, item)));
+                if (st.isDirectory()) {
+                    count++;
+                }
+            } catch {}
+        });
+        await Promise.all(promises);
+        return count;
+    } catch {
         return 0;
     }
 }
@@ -491,21 +538,25 @@ function logScanProgress(scanContext, artistName) {
     }
 }
 
-function getFilesRecursively(dir) {
+async function getFilesRecursively(dir) {
     let results = [];
     try {
-        const list = fs.readdirSync(dir);
-        list.forEach(file => {
+        const list = await fsLimit(() => fs.promises.readdir(dir));
+        const promises = list.map(async (file) => {
             const filePath = path.join(dir, file);
-            const stat = fs.statSync(filePath);
-            if (stat && stat.isDirectory()) {
-                results = results.concat(getFilesRecursively(filePath));
-            } else {
-                if (getActiveProfile().allowedExtensions.includes(path.extname(file).toLowerCase())) {
-                    results.push(filePath);
+            try {
+                const stat = await fsLimit(() => fs.promises.stat(filePath));
+                if (stat && stat.isDirectory()) {
+                    const subResults = await getFilesRecursively(filePath);
+                    results = results.concat(subResults);
+                } else {
+                    if (getActiveProfile().allowedExtensions.includes(path.extname(file).toLowerCase())) {
+                        results.push(filePath);
+                    }
                 }
-            }
+            } catch (err) {}
         });
+        await Promise.all(promises);
     } catch (err) {
         console.warn(`Skipping directory ${dir}: ${err.message}`);
     }
@@ -554,55 +605,49 @@ function countIndexableFiles(dirPath, allowedExtensions) {
 }
 
 async function scanDirectory(dirPath, artistName = null, currentTags = [], scanContext = null) {
-    if (!fs.existsSync(dirPath)) return;
+    let exists = false;
+    try {
+        exists = (await fsLimit(() => fs.promises.stat(dirPath))).isDirectory();
+    } catch {}
+    if (!exists) return;
 
-    const items = fs.readdirSync(dirPath);
-    let processedSinceYield = 0;
+    let items;
+    try {
+        items = await fsLimit(() => fs.promises.readdir(dirPath));
+    } catch {
+        return;
+    }
 
-    for (const item of items) {
-        // Keep scans responsive without incurring a per-file await cost.
-        processedSinceYield += 1;
-        if (processedSinceYield >= 200) {
-            processedSinceYield = 0;
-            await new Promise(resolve => setImmediate(resolve));
-        }
-
+    const promises = items.map(async (item) => {
         const fullPath = path.join(dirPath, item);
         let stat;
         try {
-            stat = fs.statSync(fullPath);
+            stat = await fsLimit(() => fs.promises.stat(fullPath));
         } catch (e) {
-            continue; // Skip if can't stat
+            return; // Skip if can't stat
         }
 
         if (stat.isDirectory()) {
             // LOGIC: First folder is ALWAYS Artist
             if (!artistName) {
-                logScanProgress(scanContext, item);
                 await scanDirectory(fullPath, item, [], scanContext); // Set artist, start fresh tags
-                continue;
+                logScanProgress(scanContext, item);
+                return;
             }
 
             // LOGIC: Check Strict Allowlist (supports multi-tagging with +)
-            // Split folder name by + to support multiple tags in one folder
             const folderTags = item.split('+').map(t => t.trim());
             const allTagsValid = folderTags.every(tag => getActiveProfile().allowedTags.includes(tag));
             
             if (allTagsValid && folderTags.length > 0) {
-                // All parts are valid tags -> Add all tags and go deeper
                 await scanDirectory(fullPath, artistName, [...currentTags, ...folderTags], scanContext);
             } else {
-                // It's NOT a Tag -> It is a STORY (Strict Mode)
-                // We stop checking tags and consume everything inside as pages
-                const storyPages = getFilesRecursively(fullPath);
+                const storyPages = await getFilesRecursively(fullPath);
 
                 if (storyPages.length > 0) {
-                    const modifiedAt = getStoryModifiedTime(fullPath, storyPages);
+                    const modifiedAt = await getStoryModifiedTime(fullPath, storyPages);
                     const result = insertAsset.run(fullPath, 'story', artistName, item, JSON.stringify(storyPages), modifiedAt);
-                    // Tags are auto-deleted by ON DELETE CASCADE if replaced
-                    // Add "Story" tag automatically
                     insertTag.run(result.lastInsertRowid, 'Story');
-                    // Deduplicate tags before inserting
                     const uniqueTags = [...new Set(currentTags)];
                     uniqueTags.forEach(tag => insertTag.run(result.lastInsertRowid, tag));
                 }
@@ -612,14 +657,13 @@ async function scanDirectory(dirPath, artistName = null, currentTags = [], scanC
             if (artistName && getActiveProfile().allowedExtensions.includes(path.extname(item).toLowerCase())) {
                 const modifiedAt = Math.trunc(stat.mtimeMs);
                 const result = insertAsset.run(fullPath, 'image', artistName, item, null, modifiedAt);
-                // Tags are auto-deleted by ON DELETE CASCADE if replaced
-                // Deduplicate tags before inserting
                 const uniqueTags = [...new Set(currentTags)];
                 uniqueTags.forEach(tag => insertTag.run(result.lastInsertRowid, tag));
-                // console.log(`[Image] Indexed: ${item}`);
             }
         }
-    }
+    });
+
+    await Promise.all(promises);
 }
 
 function clearDatabase() {
@@ -632,43 +676,44 @@ function clearArtistFromDatabase(artistName) {
     db.prepare('DELETE FROM assets WHERE artist = ?').run(artistName);
 }
 
-function getRootMtimeFingerprint(rootDirectory) {
+async function getRootMtimeFingerprint(rootDirectory) {
     try {
-        const stat = fs.statSync(rootDirectory);
+        const stat = await fsLimit(() => fs.promises.stat(rootDirectory));
         return String(Math.trunc(stat.mtimeMs));
     } catch {
         return null;
     }
 }
 
-function countIndexableFilesSummary(dirPath, allowedExtensions) {
-    if (!fs.existsSync(dirPath)) {
-        return { count: 0, fingerprint: getRootMtimeFingerprint(dirPath) };
+async function countIndexableFilesSummary(dirPath, allowedExtensions) {
+    let exists = false;
+    try {
+        exists = (await fsLimit(() => fs.promises.stat(dirPath))).isDirectory();
+    } catch { }
+
+    if (!exists) {
+        return { count: 0, fingerprint: await getRootMtimeFingerprint(dirPath) };
     }
 
     const extensions = new Set((allowedExtensions || []).map(ext => ext.toLowerCase()));
-    const stack = [dirPath];
     let count = 0;
     let latestMtime = 0;
 
-    while (stack.length > 0) {
-        const currentDir = stack.pop();
+    async function processDir(currentDir) {
         let items;
-
         try {
-            items = fs.readdirSync(currentDir);
+            items = await fsLimit(() => fs.promises.readdir(currentDir));
         } catch {
-            continue;
+            return;
         }
 
-        for (const item of items) {
+        const promises = items.map(async (item) => {
             const fullPath = path.join(currentDir, item);
             let stat;
-
             try {
-                stat = fs.statSync(fullPath);
+                stat = await fsLimit(() => fs.promises.stat(fullPath));
             } catch {
-                continue;
+                return;
             }
 
             if (stat.mtimeMs > latestMtime) {
@@ -676,38 +721,47 @@ function countIndexableFilesSummary(dirPath, allowedExtensions) {
             }
 
             if (stat.isDirectory()) {
-                stack.push(fullPath);
-                continue;
+                await processDir(fullPath);
+            } else {
+                if (extensions.has(path.extname(item).toLowerCase())) {
+                    count += 1;
+                }
             }
+        });
 
-            if (extensions.has(path.extname(item).toLowerCase())) {
-                count += 1;
-            }
-        }
+        await Promise.all(promises);
     }
+
+    await processDir(dirPath);
 
     const fingerprint = `${count}-${Math.trunc(latestMtime)}`;
     return { count, fingerprint };
 }
 
-function getStoryModifiedTime(storyDirectoryPath, storyPages = []) {
+async function getStoryModifiedTime(storyDirectoryPath, storyPages = []) {
     let latestMtimeMs = 0;
 
     if (storyDirectoryPath) {
         try {
-            latestMtimeMs = Math.max(latestMtimeMs, fs.statSync(storyDirectoryPath).mtimeMs);
+            const stat = await fsLimit(() => fs.promises.stat(storyDirectoryPath));
+            latestMtimeMs = Math.max(latestMtimeMs, stat.mtimeMs);
         } catch {
             // Keep fallback value when story folder cannot be stat-ed.
         }
     }
 
-    for (const storyPagePath of storyPages) {
+    const promises = storyPages.map(async (storyPagePath) => {
         try {
-            latestMtimeMs = Math.max(latestMtimeMs, fs.statSync(storyPagePath).mtimeMs);
+            const stat = await fsLimit(() => fs.promises.stat(storyPagePath));
+            if (stat.mtimeMs > latestMtimeMs) {
+                latestMtimeMs = stat.mtimeMs;
+            }
         } catch {
             // Skip missing files during scan races.
         }
-    }
+    });
+    
+    await Promise.all(promises);
 
     return Math.trunc(latestMtimeMs);
 }
@@ -850,6 +904,8 @@ async function runScanJob({ updateBootstrapStatus = false, allowFastSkip = false
     }
 
     isScanning = true;
+    setScanStatusRunning(activeProfileName, 0, false);
+    
     if (updateBootstrapStatus) {
         bootstrapStatus = {
             status: 'running',
@@ -864,7 +920,7 @@ async function runScanJob({ updateBootstrapStatus = false, allowFastSkip = false
     try {
         const rootDirectory = getActiveProfile().rootDirectory;
         const allowedExtensions = getActiveProfile().allowedExtensions;
-        const summary = countIndexableFilesSummary(rootDirectory, allowedExtensions);
+        const summary = await countIndexableFilesSummary(rootDirectory, allowedExtensions);
         const currentIndexedFileCount = summary.count;
         const currentIndexedFingerprint = summary.fingerprint;
         const existingMetadata = getScanMetadata(activeProfileName);
@@ -881,8 +937,7 @@ async function runScanJob({ updateBootstrapStatus = false, allowFastSkip = false
             lastIndexedFingerprint,
             currentIndexedFingerprint
         });
-
-        setScanStatusRunning(activeProfileName, 0);
+        
         const fastCheckLine = `[Scan][${activeProfileName}] Fast check (${trigger}) - current files: ${currentIndexedFileCount}, previous files: ${lastIndexedFileCount === null ? 'none' : lastIndexedFileCount}`;
         appendScanLog(fastCheckLine);
         console.log(fastCheckLine);
@@ -922,8 +977,8 @@ async function runScanJob({ updateBootstrapStatus = false, allowFastSkip = false
         }
 
         clearDatabase();
-        const totalArtists = countArtists(rootDirectory);
-        setScanStatusRunning(activeProfileName, totalArtists);
+        const totalArtists = await countArtists(rootDirectory);
+        setScanStatusRunning(activeProfileName, totalArtists, true);
 
         const scanContext = {
             totalArtists,
