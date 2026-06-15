@@ -214,7 +214,7 @@ try {
 
 	Start-Sleep -Seconds 3
 	Write-Host "Opening browser to http://localhost:5173" -ForegroundColor Green
-	Start-Process -FilePath "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" -ArgumentList '--profile-directory="Profile 1"', "http://localhost:5173"
+	Start-Process -FilePath "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe" -ArgumentList "http://localhost:5173"
 
 	Write-Host "Press Ctrl+C to stop both services." -ForegroundColor Yellow
 	Write-Host "Backend PID: $($backend.Pid) | Frontend PID: $($frontend.Pid)" -ForegroundColor DarkGray
